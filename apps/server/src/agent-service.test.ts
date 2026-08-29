@@ -14,7 +14,10 @@ import { loadConfig } from "./config.js";
 import { RunCancelledError, RunTimedOutError } from "./errors.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
-import { RunVaultWorkspaceManager } from "./runvault-workspace.js";
+import {
+  RunVaultWorkspaceManager,
+  type RunVaultPromotion,
+} from "./runvault-workspace.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -33,6 +36,33 @@ class FakeRunner implements AgentRunner {
   }
 }
 
+class BlockingFinalizeWorkspaceManager extends RunVaultWorkspaceManager {
+  private signalFinalizeStarted!: () => void;
+  private allowFinalizeToContinue!: () => void;
+  readonly finalizeStarted: Promise<void>;
+  private readonly finalizeAllowed: Promise<void>;
+
+  constructor(workspaceRoot: string) {
+    super(workspaceRoot);
+    this.finalizeStarted = new Promise((resolve) => {
+      this.signalFinalizeStarted = resolve;
+    });
+    this.finalizeAllowed = new Promise((resolve) => {
+      this.allowFinalizeToContinue = resolve;
+    });
+  }
+
+  allowFinalize(): void {
+    this.allowFinalizeToContinue();
+  }
+
+  override async finalizePromotion(promotion: RunVaultPromotion): Promise<void> {
+    this.signalFinalizeStarted();
+    await this.finalizeAllowed;
+    await super.finalizePromotion(promotion);
+  }
+}
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -44,22 +74,25 @@ afterEach(async () => {
   );
 });
 
-async function makeServiceHarness(runner: AgentRunner = new FakeRunner()) {
+async function makeServiceHarness(
+  runner: AgentRunner = new FakeRunner(),
+  createRunVaultWorkspaces: (workspaceRoot: string) => RunVaultWorkspaceManager =
+    (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
+) {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
+  const workspaceRoot = path.join(root, "workspaces");
   const config = loadConfig({
     NODE_ENV: "test",
     APP_DATA_DIR: path.join(root, "data"),
-    AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+    AGENT_WORKSPACE_ROOT: workspaceRoot,
     CODEX_HOME: path.join(root, "codex"),
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
   });
   const store = new JsonStore(path.join(root, "data", "db.json"));
-  const workspaces = new WorkspaceManager(path.join(root, "workspaces"));
-  const runVaultWorkspaces = new RunVaultWorkspaceManager(
-    path.join(root, "workspaces"),
-  );
+  const workspaces = new WorkspaceManager(workspaceRoot);
+  const runVaultWorkspaces = createRunVaultWorkspaces(workspaceRoot);
   const service = new AgentService(
     config,
     store,
@@ -257,6 +290,54 @@ describe("Agent lifecycle", () => {
     });
     expect(await readFile(path.join(agent.workspacePath, "source.ts"), "utf8"))
       .toBe("updated\n");
+  });
+
+  it("publishes completion only after promotion cleanup finishes", async () => {
+    let runVaultWorkspaces!: BlockingFinalizeWorkspaceManager;
+    const harness = await makeServiceHarness(
+      {
+        run: async (request) => {
+          await writeFile(path.join(request.workspacePath, "source.ts"), "updated\n");
+          return {
+            output: "Updated source",
+            threadId: "finalized-thread",
+            usage: null,
+          };
+        },
+        cancel: async () => false,
+        isAvailable: async () => true,
+      },
+      (workspaceRoot) => {
+        runVaultWorkspaces = new BlockingFinalizeWorkspaceManager(workspaceRoot);
+        return runVaultWorkspaces;
+      },
+    );
+    const agent = await harness.service.createAgent({ name: "Atomic builder" });
+    await writeFile(path.join(agent.workspacePath, "source.ts"), "original\n");
+
+    const { run } = await harness.service.sendMessage(agent.id, "update atomically");
+    await runVaultWorkspaces.finalizeStarted;
+
+    try {
+      expect(harness.service.getRun(run.id)).toMatchObject({
+        status: "running",
+        runVault: { outcome: "promoted" },
+      });
+      expect(harness.service.getAgent(agent.id).status).toBe("busy");
+      await expect(
+        lstat(runVaultWorkspaces.promotionMarkerPath(run.id)),
+      ).resolves.toBeDefined();
+    } finally {
+      runVaultWorkspaces.allowFinalize();
+      await expect
+        .poll(() => harness.service.getRun(run.id).status)
+        .toBe("completed");
+    }
+
+    expect(harness.service.getAgent(agent.id).status).toBe("ready");
+    await expect(
+      lstat(runVaultWorkspaces.promotionMarkerPath(run.id)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("promotes a safe documentation-only change", async () => {
@@ -731,6 +812,94 @@ describe("Agent lifecycle", () => {
     expect(await readFile(path.join(agent.workspacePath, "trusted.txt"), "utf8"))
       .toBe("trusted\n");
     await expect(lstat(staging.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("finishes a committed promotion before publishing restart recovery", async () => {
+    const harness = await makeServiceHarness();
+    const agent = await harness.service.createAgent({ name: "Committed builder" });
+    await writeFile(path.join(agent.workspacePath, "source.ts"), "original\n");
+    const staging = await harness.runVaultWorkspaces.createStagingWorkspace(
+      "run-committed",
+      agent.workspacePath,
+    );
+    await writeFile(path.join(staging.path, "source.ts"), "promoted\n");
+    const inspection = await harness.runVaultWorkspaces.inspectChanges(
+      staging.trustedSnapshot,
+      staging.path,
+    );
+    const promotion = await harness.runVaultWorkspaces.beginPromotion(
+      staging.id,
+      agent.workspacePath,
+      staging.trustedSnapshot.fingerprint,
+    );
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    await harness.store.mutate((database) => {
+      const storedAgent = database.agents.find((candidate) => candidate.id === agent.id);
+      if (!storedAgent) throw new Error("fixture Agent missing");
+      storedAgent.status = "busy";
+      storedAgent.codexThreadId = "committed-thread";
+      database.runs.push({
+        id: staging.id,
+        agentId: agent.id,
+        status: "running",
+        prompt: "committed work",
+        output: "Committed output",
+        error: null,
+        usage: null,
+        runVault: {
+          outcome: "promoted",
+          reason: "verified_safe",
+          resolution: "policy",
+          stagingWorkspaceId: staging.id,
+          provisionalThreadId: "committed-thread",
+          trustedWorkspaceFingerprint: staging.trustedSnapshot.fingerprint,
+          stagingWorkspaceFingerprint: inspection.stagingFingerprint,
+          changedFiles: {
+            addedCount: 0,
+            modifiedCount: 1,
+            deletedCount: 0,
+            protectedPathsTouched: [],
+          },
+          verification: {
+            status: "skipped",
+            command: null,
+            redactedSummary: "No test command detected.",
+          },
+          trustedWorkspaceChanged: false,
+          decidedAt: timestamp,
+        },
+        startedAt: timestamp,
+        completedAt: null,
+        createdAt: timestamp,
+      });
+    });
+
+    const restarted = new AgentService(
+      harness.config,
+      new JsonStore(path.join(harness.root, "data", "db.json")),
+      new WorkspaceManager(path.join(harness.root, "workspaces")),
+      new FakeRunner(),
+      new RunVaultWorkspaceManager(path.join(harness.root, "workspaces")),
+    );
+    await restarted.initialize();
+
+    expect(restarted.getRun(staging.id)).toMatchObject({
+      status: "completed",
+      error: null,
+      runVault: { outcome: "promoted" },
+    });
+    expect(restarted.getAgent(agent.id)).toMatchObject({
+      status: "ready",
+      codexThreadId: "committed-thread",
+    });
+    expect(await readFile(path.join(agent.workspacePath, "source.ts"), "utf8"))
+      .toBe("promoted\n");
+    await expect(lstat(promotion.backupWorkspacePath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(lstat(promotion.markerPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("quarantines when trusted files change while a Run is active", async () => {
