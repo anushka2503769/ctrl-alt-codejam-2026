@@ -73,6 +73,9 @@ export class AgentService {
     await this.store.mutate((database) => {
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
+          if (run.runVault?.outcome === "promoted") {
+            continue;
+          }
           const completedAt = now();
           run.status = "cancelled";
           run.error = "Server restarted while this run was active";
@@ -103,13 +106,43 @@ export class AgentService {
         }
       }
       for (const agent of database.agents) {
-        if (agent.status === "busy") {
+        const hasCommittedPromotion = database.runs.some(
+          (run) =>
+            run.agentId === agent.id &&
+            (run.status === "queued" || run.status === "running") &&
+            run.runVault?.outcome === "promoted",
+        );
+        if (agent.status === "busy" && !hasCommittedPromotion) {
           agent.status = "ready";
           agent.updatedAt = now();
         }
       }
     });
     await this.runVaultWorkspaces.reconcileTransactions(this.store.snapshot());
+    await this.store.mutate((database) => {
+      const recoveredAt = now();
+      for (const run of database.runs) {
+        if (
+          (run.status === "queued" || run.status === "running") &&
+          run.runVault?.outcome === "promoted"
+        ) {
+          run.status = "completed";
+          run.error = null;
+          run.completedAt = run.completedAt ?? recoveredAt;
+        }
+      }
+      for (const agent of database.agents) {
+        const hasActiveRun = database.runs.some(
+          (run) =>
+            run.agentId === agent.id &&
+            (run.status === "queued" || run.status === "running"),
+        );
+        if (agent.status === "busy" && !hasActiveRun) {
+          agent.status = "ready";
+          agent.updatedAt = recoveredAt;
+        }
+      }
+    });
   }
 
   listAgents(): Agent[] {
@@ -426,6 +459,7 @@ export class AgentService {
     });
     let staging: StagingWorkspace | null = null;
     let runnerResult: RunnerResult | null = null;
+    let promotionCommitted = false;
     let verification = skippedVerification(
       "Verification was not run because Agent execution did not complete.",
     );
@@ -541,13 +575,13 @@ export class AgentService {
             if (this.cancellationRequests.has(agentAtStart.id)) {
               throw new RunCancelledError();
             }
-            await this.persistCompletedRun(
+            await this.persistPromotionCommitment(
               agentAtStart,
               run,
               runnerResult,
               decision,
-              true,
             );
+            promotionCommitted = true;
           } catch (error) {
             await this.runVaultWorkspaces.rollbackPromotion(promotion);
             throw error;
@@ -555,6 +589,7 @@ export class AgentService {
           await this.runVaultWorkspaces.finalizePromotion(promotion).catch(
             () => undefined,
           );
+          await this.publishCommittedPromotion(agentAtStart.id, run.id);
           return;
         }
       }
@@ -564,7 +599,6 @@ export class AgentService {
         run,
         runnerResult,
         decision,
-        false,
       );
       if (decision.outcome === "discarded") {
         await this.runVaultWorkspaces
@@ -572,6 +606,12 @@ export class AgentService {
           .catch(() => undefined);
       }
     } catch (error) {
+      if (promotionCommitted) {
+        await this.publishCommittedPromotion(agentAtStart.id, run.id).catch(
+          () => undefined,
+        );
+        return;
+      }
       const completedAt = now();
       const cancelled =
         error instanceof RunCancelledError ||
@@ -660,7 +700,6 @@ export class AgentService {
     run: AgentRun,
     result: RunnerResult,
     decision: RunVaultDecision,
-    promoted: boolean,
   ): Promise<void> {
     const completedAt = now();
     await this.store.mutate((database) => {
@@ -672,18 +711,68 @@ export class AgentService {
       storedRun.usage = result.usage;
       storedRun.runVault = decision;
       storedRun.completedAt = completedAt;
-      if (promoted) {
+      agent.status = "ready";
+      agent.lastError = null;
+      agent.updatedAt = completedAt;
+    });
+  }
+
+  private async persistPromotionCommitment(
+    agentAtStart: Agent,
+    run: AgentRun,
+    result: RunnerResult,
+    decision: RunVaultDecision,
+  ): Promise<void> {
+    const committedAt = now();
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === run.id);
+      const agent = database.agents.find((item) => item.id === agentAtStart.id);
+      if (!storedRun || !agent) {
+        throw new Error("Run or Agent disappeared while promotion was committed");
+      }
+      storedRun.output = result.output;
+      storedRun.usage = result.usage;
+      storedRun.runVault = decision;
+      if (
+        !database.messages.some(
+          (message) => message.runId === run.id && message.role === "assistant",
+        )
+      ) {
         database.messages.push({
           id: randomUUID(),
           agentId: agent.id,
           runId: run.id,
           role: "assistant",
           content: result.output,
-          createdAt: completedAt,
+          createdAt: committedAt,
         });
-        agent.codexThreadId = result.threadId;
       }
-      agent.status = "ready";
+      agent.codexThreadId = result.threadId;
+      agent.lastError = null;
+      agent.updatedAt = committedAt;
+    });
+  }
+
+  private async publishCommittedPromotion(
+    agentId: string,
+    runId: string,
+  ): Promise<void> {
+    const completedAt = now();
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === runId);
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!storedRun || !agent) {
+        throw new Error("Run or Agent disappeared while promotion was finalized");
+      }
+      if (storedRun.runVault?.outcome !== "promoted") {
+        throw new Error("RunVault promotion commitment is missing");
+      }
+      storedRun.status = "completed";
+      storedRun.error = null;
+      storedRun.completedAt = completedAt;
+      if (agent.status !== "stopped") {
+        agent.status = "ready";
+      }
       agent.lastError = null;
       agent.updatedAt = completedAt;
     });
