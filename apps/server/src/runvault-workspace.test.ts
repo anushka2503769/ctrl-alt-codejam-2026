@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { Database, RunVaultOutcome } from "./types.js";
 import {
   isDependencyFile,
   isProtectedRunVaultPath,
@@ -36,6 +37,67 @@ afterEach(async () => {
 
 async function stage(id = "run-1") {
   return manager.createStagingWorkspace(id, trusted);
+}
+
+function databaseForRun(
+  runId: string,
+  outcome: RunVaultOutcome,
+): Database {
+  const timestamp = "2026-01-01T00:00:00.000Z";
+  return {
+    version: 1,
+    agents: [
+      {
+        id: "agent-1",
+        name: "Recovery Agent",
+        description: "",
+        instructions: "",
+        status: "ready",
+        workspacePath: trusted,
+        codexThreadId: outcome === "promoted" ? "thread-1" : null,
+        lastError: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      },
+    ],
+    messages: [],
+    runs: [
+      {
+        id: runId,
+        agentId: "agent-1",
+        status: "completed",
+        prompt: "change state",
+        output: "changed state",
+        error: null,
+        usage: null,
+        runVault: {
+          outcome,
+          reason: "protected_path",
+          resolution: outcome === "promoted" ? "human_approved" : "policy",
+          stagingWorkspaceId: runId,
+          provisionalThreadId: "thread-1",
+          trustedWorkspaceFingerprint: "trusted-fingerprint",
+          stagingWorkspaceFingerprint: "staging-fingerprint",
+          changedFiles: {
+            addedCount: 0,
+            modifiedCount: 1,
+            deletedCount: 0,
+            protectedPathsTouched: ["state.txt"],
+          },
+          verification: {
+            status: "passed",
+            command: "npm test",
+            redactedSummary: "passed",
+          },
+          trustedWorkspaceChanged: false,
+          decidedAt: timestamp,
+        },
+        startedAt: timestamp,
+        completedAt: timestamp,
+        createdAt: timestamp,
+      },
+    ],
+  };
 }
 
 describe("RunVaultWorkspaceManager", () => {
@@ -245,10 +307,75 @@ describe("RunVaultWorkspaceManager", () => {
       staging.trustedSnapshot.fingerprint,
     );
     expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe("staged\n");
+    await expect(readFile(manager.promotionMarkerPath(staging.id), "utf8"))
+      .resolves.toContain('"phase":"installed"');
 
     await manager.rollbackPromotion(promotion);
     expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe("trusted\n");
     expect(await readFile(path.join(staging.path, "state.txt"), "utf8")).toBe("staged\n");
+    await expect(lstat(manager.promotionMarkerPath(staging.id))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rolls back an installed promotion when the database did not commit it", async () => {
+    await writeFile(path.join(trusted, "state.txt"), "trusted\n");
+    const staging = await stage("run-interrupted");
+    await writeFile(path.join(staging.path, "state.txt"), "staged\n");
+    await manager.beginPromotion(
+      staging.id,
+      trusted,
+      staging.trustedSnapshot.fingerprint,
+    );
+
+    const restarted = new RunVaultWorkspaceManager(root);
+    await restarted.reconcileTransactions(
+      databaseForRun(staging.id, "quarantined"),
+    );
+
+    expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe(
+      "trusted\n",
+    );
+    expect(await readFile(path.join(staging.path, "state.txt"), "utf8")).toBe(
+      "staged\n",
+    );
+    await expect(lstat(path.join(root, ".staging", `${staging.id}.backup`)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(restarted.promotionMarkerPath(staging.id))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("finishes cleanup when the database committed an installed promotion", async () => {
+    await writeFile(path.join(trusted, "state.txt"), "trusted\n");
+    const staging = await stage("run-committed");
+    await writeFile(path.join(staging.path, "state.txt"), "staged\n");
+    await manager.beginPromotion(
+      staging.id,
+      trusted,
+      staging.trustedSnapshot.fingerprint,
+    );
+
+    const restarted = new RunVaultWorkspaceManager(root);
+    await restarted.reconcileTransactions(databaseForRun(staging.id, "promoted"));
+
+    expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe(
+      "staged\n",
+    );
+    await expect(lstat(path.join(root, ".staging", `${staging.id}.backup`)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(restarted.promotionMarkerPath(staging.id))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("removes orphan staging while preserving persisted quarantine", async () => {
+    const retained = await stage("run-retained");
+    const orphan = await stage("run-orphan");
+
+    await manager.reconcileTransactions(
+      databaseForRun(retained.id, "quarantined"),
+    );
+
+    await expect(lstat(retained.path)).resolves.toBeDefined();
+    await expect(lstat(orphan.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("refuses promotion after the trusted workspace changes", async () => {

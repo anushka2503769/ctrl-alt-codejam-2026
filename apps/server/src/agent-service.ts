@@ -73,9 +73,33 @@ export class AgentService {
     await this.store.mutate((database) => {
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
+          const completedAt = now();
           run.status = "cancelled";
           run.error = "Server restarted while this run was active";
-          run.completedAt = now();
+          run.runVault = {
+            outcome: "discarded",
+            reason: "cancelled",
+            resolution: "policy",
+            stagingWorkspaceId: run.runVault?.stagingWorkspaceId ?? run.id,
+            provisionalThreadId: run.runVault?.provisionalThreadId ?? null,
+            trustedWorkspaceFingerprint:
+              run.runVault?.trustedWorkspaceFingerprint ?? null,
+            stagingWorkspaceFingerprint:
+              run.runVault?.stagingWorkspaceFingerprint ?? null,
+            changedFiles: run.runVault?.changedFiles ?? {
+              addedCount: 0,
+              modifiedCount: 0,
+              deletedCount: 0,
+              protectedPathsTouched: [],
+            },
+            verification: skippedVerification(
+              "Verification was interrupted when the server restarted.",
+            ),
+            trustedWorkspaceChanged:
+              run.runVault?.trustedWorkspaceChanged ?? false,
+            decidedAt: completedAt,
+          };
+          run.completedAt = completedAt;
         }
       }
       for (const agent of database.agents) {
@@ -85,6 +109,7 @@ export class AgentService {
         }
       }
     });
+    await this.runVaultWorkspaces.reconcileTransactions(this.store.snapshot());
   }
 
   listAgents(): Agent[] {
