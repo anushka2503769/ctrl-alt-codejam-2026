@@ -274,6 +274,165 @@ describe("Agent lifecycle", () => {
     expect(service.getMessages(agent.id).map((message) => message.role)).toEqual(["user"]);
   });
 
+  it("approves quarantined work exactly once and commits its thread", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await mkdir(path.join(request.workspacePath, "deploy"));
+        await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "approved\n");
+        return {
+          output: "Prepared deployment",
+          threadId: "approved-thread",
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Approval builder" });
+    const { run } = await service.sendMessage(agent.id, "prepare deployment");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const approved = await service.approveRun(run.id);
+    const repeated = await service.approveRun(run.id);
+
+    expect(approved.runVault).toMatchObject({
+      outcome: "promoted",
+      reason: "protected_path",
+      resolution: "human_approved",
+    });
+    expect(repeated).toEqual(approved);
+    expect(await readFile(path.join(agent.workspacePath, "deploy", "app.yml"), "utf8"))
+      .toBe("approved\n");
+    expect(service.getAgent(agent.id).codexThreadId).toBe("approved-thread");
+    expect(
+      service.getMessages(agent.id).filter((message) => message.role === "assistant"),
+    ).toHaveLength(1);
+    await expect(service.discardRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("discards quarantined work idempotently without committing its thread", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await mkdir(path.join(request.workspacePath, "deploy"));
+        await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "discard\n");
+        return {
+          output: "Prepared risky deployment",
+          threadId: "discarded-thread",
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Discard builder" });
+    const { run } = await service.sendMessage(agent.id, "prepare risky deployment");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const discarded = await service.discardRun(run.id);
+    const repeated = await service.discardRun(run.id);
+
+    expect(discarded.runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "protected_path",
+      resolution: "human_discarded",
+    });
+    expect(repeated).toEqual(discarded);
+    expect(service.getAgent(agent.id).codexThreadId).toBeNull();
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      lstat(path.join(path.dirname(agent.workspacePath), ".staging", run.id)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(service.approveRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("removes retained quarantined staging when its Agent is deleted", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await mkdir(path.join(request.workspacePath, "deploy"));
+        await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "retained\n");
+        return { output: "Prepared deployment", threadId: "deleted-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Deleted quarantine" });
+    const { run } = await service.sendMessage(agent.id, "prepare deployment");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    const stagingPath = path.join(path.dirname(agent.workspacePath), ".staging", run.id);
+    await expect(lstat(stagingPath)).resolves.toBeDefined();
+
+    await service.deleteAgent(agent.id);
+
+    await expect(lstat(stagingPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses approval after the trusted workspace changes", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await mkdir(path.join(request.workspacePath, "deploy"));
+        await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "staged\n");
+        return { output: "Prepared deployment", threadId: "stale-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Stale approval builder" });
+    const { run } = await service.sendMessage(agent.id, "prepare deployment");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    await writeFile(path.join(agent.workspacePath, "external.txt"), "keep me\n");
+
+    await expect(service.approveRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "trusted_workspace_changed",
+      trustedWorkspaceChanged: true,
+    });
+    expect(await readFile(path.join(agent.workspacePath, "external.txt"), "utf8"))
+      .toBe("keep me\n");
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(service.getAgent(agent.id).status).toBe("ready");
+  });
+
+  it("refuses approval if quarantined staging files were modified", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await mkdir(path.join(request.workspacePath, "deploy"));
+        await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "inspected\n");
+        return { output: "Prepared deployment", threadId: "tampered-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Tamper-aware builder" });
+    const { run } = await service.sendMessage(agent.id, "prepare deployment");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    const stagingPath = path.join(path.dirname(agent.workspacePath), ".staging", run.id);
+    await writeFile(path.join(stagingPath, "uninspected.txt"), "tampered\n");
+
+    await expect(service.approveRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(service.getRun(run.id).runVault?.outcome).toBe("quarantined");
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(service.getAgent(agent.id).status).toBe("ready");
+  });
+
+  it("rejects lifecycle actions for an automatically promoted Run", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Already safe" });
+    const { run } = await service.sendMessage(agent.id, "safe run");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    await expect(service.approveRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.discardRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
   it("discards staged work when verification fails", async () => {
     const service = await makeService({
       run: async (request) => {

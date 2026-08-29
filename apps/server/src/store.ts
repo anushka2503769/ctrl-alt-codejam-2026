@@ -25,6 +25,11 @@ export class JsonStore {
       }
       for (const run of parsed.runs) {
         run.runVault ??= null;
+        if (run.runVault) {
+          run.runVault.resolution ??= "policy";
+          run.runVault.trustedWorkspaceFingerprint ??= null;
+          run.runVault.stagingWorkspaceFingerprint ??= null;
+        }
       }
       this.data = parsed;
     } catch (error) {

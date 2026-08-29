@@ -122,6 +122,10 @@ export function isProtectedRunVaultPath(relativePath: string): boolean {
   return (
     normalized === ".env" ||
     normalized.startsWith(".env.") ||
+    normalized === ".codex" ||
+    normalized.startsWith(".codex/") ||
+    normalized === ".staging" ||
+    normalized.startsWith(".staging/") ||
     normalized === "AGENTS.md" ||
     normalized === ".github/workflows" ||
     normalized.startsWith(".github/workflows/") ||
@@ -182,6 +186,7 @@ async function collectEntries(
   root: string,
   current: string,
   entries: WorkspaceEntrySnapshot[],
+  excludeReservedDirectories: boolean,
 ): Promise<void> {
   const children = await readdir(current, { withFileTypes: true });
   children.sort((left, right) => left.name.localeCompare(right.name));
@@ -189,7 +194,7 @@ async function collectEntries(
   for (const child of children) {
     const absolutePath = path.join(current, child.name);
     const relativePath = toRelativePath(root, absolutePath);
-    if (shouldExclude(relativePath)) continue;
+    if (excludeReservedDirectories && shouldExclude(relativePath)) continue;
 
     const stats = await lstat(absolutePath);
     if (stats.isDirectory()) {
@@ -200,7 +205,12 @@ async function collectEntries(
         mode: stats.mode & 0o777,
         binary: false,
       });
-      await collectEntries(root, absolutePath, entries);
+      await collectEntries(
+        root,
+        absolutePath,
+        entries,
+        excludeReservedDirectories,
+      );
       continue;
     }
     if (stats.isFile()) {
@@ -329,7 +339,12 @@ export class RunVaultWorkspaceManager {
       throw new Error("Workspace path is outside the managed workspace root");
     }
     const entries: WorkspaceEntrySnapshot[] = [];
-    await collectEntries(resolvedPath, resolvedPath, entries);
+    await collectEntries(
+      resolvedPath,
+      resolvedPath,
+      entries,
+      !isInside(this.stagingRoot, resolvedPath),
+    );
     return { entries, fingerprint: fingerprintEntries(entries) };
   }
 
