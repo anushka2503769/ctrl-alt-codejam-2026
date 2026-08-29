@@ -170,6 +170,7 @@ export class AgentService {
       output: null,
       error: null,
       usage: null,
+      runVault: null,
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
