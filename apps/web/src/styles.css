@@ -824,6 +824,288 @@ textarea:focus {
   font-size: 11px;
 }
 
+.runvault-panel {
+  --runvault-accent: #6d5bd0;
+  margin: 18px 0 2px;
+  border: 1px solid #d8d5cc;
+  border-top: 3px solid var(--runvault-accent);
+  border-radius: 13px;
+  padding: 14px 15px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 13px 30px rgba(43, 42, 38, 0.08);
+}
+
+.runvault-promoted {
+  --runvault-accent: #33906d;
+}
+
+.runvault-quarantined {
+  --runvault-accent: #b27b20;
+  background: rgba(255, 252, 243, 0.96);
+}
+
+.runvault-discarded {
+  --runvault-accent: #a85a57;
+}
+
+.runvault-heading,
+.runvault-identity,
+.runvault-reason,
+.runvault-actions,
+.runvault-actions > div {
+  display: flex;
+  align-items: center;
+}
+
+.runvault-heading {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.runvault-identity {
+  gap: 10px;
+}
+
+.runvault-mark {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: white;
+  background: var(--runvault-accent);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  box-shadow: 0 7px 16px color-mix(in srgb, var(--runvault-accent) 25%, transparent);
+}
+
+.runvault-heading h3 {
+  margin: 2px 0 0;
+  font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+  font-size: 15px;
+  letter-spacing: -0.025em;
+}
+
+.runvault-outcome {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 9px;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+
+.runvault-outcome > span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.outcome-promoted {
+  color: #267758;
+  background: #ddf1e9;
+}
+
+.outcome-quarantined {
+  color: #8a5c10;
+  background: #f8e9c8;
+}
+
+.outcome-discarded {
+  color: #98504d;
+  background: #f5e3e1;
+}
+
+.runvault-reason {
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 11px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: #f4f2ec;
+}
+
+.runvault-reason strong {
+  font-size: 11px;
+}
+
+.runvault-reason span {
+  color: #85867f;
+  font-size: 9px;
+  text-align: right;
+}
+
+.runvault-evidence {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: 10px 0 0;
+  overflow: hidden;
+  border: 1px solid #e1dfd7;
+  border-radius: 10px;
+  background: #e1dfd7;
+}
+
+.runvault-evidence > div {
+  min-width: 0;
+  padding: 8px 10px;
+  background: white;
+}
+
+.runvault-evidence dt {
+  margin-bottom: 4px;
+  color: #8a8b83;
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.runvault-evidence dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #494a44;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.change-count-detail {
+  display: block;
+  margin-top: 3px;
+  color: #91928a;
+  font-size: 8px;
+  font-weight: 500;
+  text-transform: none;
+}
+
+.runvault-evidence .evidence-passed {
+  color: #267758;
+}
+
+.runvault-evidence .evidence-failed,
+.runvault-evidence .evidence-warning {
+  color: #a04d48;
+}
+
+.runvault-evidence .evidence-skipped {
+  color: #806429;
+}
+
+.protected-paths {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid #e4e1d9;
+}
+
+.protected-paths-label {
+  display: block;
+  margin-bottom: 7px;
+  color: #7c6334;
+  font-size: 8px;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+}
+
+.protected-paths > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.protected-paths code {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border: 1px solid #ead7ac;
+  border-radius: 6px;
+  padding: 4px 7px;
+  color: #75561b;
+  background: #fff8e5;
+  font-size: 9px;
+}
+
+.protected-paths p,
+.runvault-actions p {
+  margin: 7px 0 0;
+  color: #8b8c84;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.verification-details {
+  margin-top: 8px;
+  color: #6f7069;
+  font-size: 9px;
+}
+
+.verification-details summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.verification-details p {
+  max-height: 110px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 7px 0 0;
+  border-radius: 7px;
+  padding: 8px;
+  background: #f3f2ed;
+  line-height: 1.5;
+}
+
+.runvault-actions {
+  justify-content: space-between;
+  gap: 18px;
+  margin: 10px -15px -14px;
+  border-top: 1px solid #e2ded1;
+  border-radius: 0 0 12px 12px;
+  padding: 10px 15px;
+  background: #faf4e6;
+}
+
+.runvault-actions p {
+  max-width: 330px;
+  margin: 0;
+  color: #725f3b;
+}
+
+.runvault-actions > div {
+  flex: 0 0 auto;
+  gap: 7px;
+}
+
+.runvault-discard {
+  border: 1px solid #d9d4c8;
+  color: #6d6e67;
+  background: #fffdf8;
+}
+
+.runvault-discard:hover:not(:disabled) {
+  border-color: #be716c;
+  color: #984f4b;
+  background: #fff7f5;
+}
+
+.runvault-approve {
+  color: white;
+  background: #3b866a;
+  box-shadow: 0 7px 16px rgba(39, 117, 86, 0.18);
+}
+
+.runvault-approve:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: #2d7358;
+}
+
 .composer {
   margin: 0;
   border-top: 1px solid #e1dfd8;
@@ -1090,6 +1372,30 @@ textarea:focus {
 
   .message-user {
     margin-left: 8%;
+  }
+
+  .runvault-heading,
+  .runvault-reason,
+  .runvault-actions {
+    align-items: flex-start;
+  }
+
+  .runvault-reason,
+  .runvault-actions {
+    flex-direction: column;
+  }
+
+  .runvault-reason span {
+    text-align: left;
+  }
+
+  .runvault-evidence {
+    grid-template-columns: 1fr;
+  }
+
+  .runvault-actions > div,
+  .runvault-actions .button {
+    width: 100%;
   }
 
   .form-grid {
