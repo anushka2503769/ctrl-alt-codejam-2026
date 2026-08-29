@@ -212,4 +212,38 @@ describe("RunVaultWorkspaceManager", () => {
     await expect(lstat(first.path)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(lstat(second.path)).resolves.toBeDefined();
   });
+
+  it("installs a staged workspace and can roll the promotion back", async () => {
+    await writeFile(path.join(trusted, "state.txt"), "trusted\n");
+    const staging = await stage();
+    await writeFile(path.join(staging.path, "state.txt"), "staged\n");
+
+    const promotion = await manager.beginPromotion(
+      staging.id,
+      trusted,
+      staging.trustedSnapshot.fingerprint,
+    );
+    expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe("staged\n");
+
+    await manager.rollbackPromotion(promotion);
+    expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe("trusted\n");
+    expect(await readFile(path.join(staging.path, "state.txt"), "utf8")).toBe("staged\n");
+  });
+
+  it("refuses promotion after the trusted workspace changes", async () => {
+    await writeFile(path.join(trusted, "state.txt"), "trusted\n");
+    const staging = await stage();
+    await writeFile(path.join(trusted, "state.txt"), "external edit\n");
+
+    await expect(
+      manager.beginPromotion(
+        staging.id,
+        trusted,
+        staging.trustedSnapshot.fingerprint,
+      ),
+    ).rejects.toThrow("Trusted workspace changed before promotion");
+    expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe(
+      "external edit\n",
+    );
+  });
 });

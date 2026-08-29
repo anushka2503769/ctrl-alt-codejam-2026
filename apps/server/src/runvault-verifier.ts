@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { lstat, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { RunCancelledError } from "./errors.js";
 import type { RunVaultVerification } from "./types.js";
 
 export const DEFAULT_VERIFICATION_TIMEOUT_MS = 120_000;
@@ -158,7 +159,11 @@ export class RunVaultVerifier {
     }
   }
 
-  async verify(workspacePath: string): Promise<RunVaultVerificationResult> {
+  async verify(
+    workspacePath: string,
+    signal?: AbortSignal,
+  ): Promise<RunVaultVerificationResult> {
+    if (signal?.aborted) throw new RunCancelledError();
     const manifestPath = path.join(workspacePath, "package.json");
     let manifestStats;
     try {
@@ -204,13 +209,17 @@ export class RunVaultVerifier {
       };
     }
 
-    return this.runNpmTest(workspacePath);
+    return this.runNpmTest(workspacePath, signal);
   }
 
-  private async runNpmTest(workspacePath: string): Promise<RunVaultVerificationResult> {
+  private async runNpmTest(
+    workspacePath: string,
+    signal?: AbortSignal,
+  ): Promise<RunVaultVerificationResult> {
     const temporaryHome = await mkdtemp(path.join(tmpdir(), "runvault-verify-"));
     const output = new BoundedOutput(this.maxOutputBytes);
     let timedOut = false;
+    let aborted = false;
 
     try {
       const child = spawn(this.npmCommand, ["test"], {
@@ -221,6 +230,11 @@ export class RunVaultVerifier {
       });
       child.stdout?.on("data", (chunk: Buffer) => output.append(chunk));
       child.stderr?.on("data", (chunk: Buffer) => output.append(chunk));
+      const abort = () => {
+        aborted = true;
+        terminateProcess(child, "SIGTERM");
+      };
+      signal?.addEventListener("abort", abort, { once: true });
 
       let forceKillTimer: NodeJS.Timeout | undefined;
       const timeout = setTimeout(() => {
@@ -247,10 +261,13 @@ export class RunVaultVerifier {
 
       clearTimeout(timeout);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      signal?.removeEventListener("abort", abort);
       const captured = redactVerificationOutput(
         output.toString(),
         this.sourceEnvironment,
       );
+
+      if (aborted) throw new RunCancelledError();
 
       if (timedOut) {
         return {

@@ -1,9 +1,17 @@
-import { mkdtemp } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
+import { RunCancelledError, RunTimedOutError } from "./errors.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -78,6 +86,281 @@ describe("Agent lifecycle", () => {
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(messages[1]?.content).toContain("write hello world");
     expect(service.getAgent(agent.id).codexThreadId).toBe("fake-thread");
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "promoted",
+      reason: "verified_safe",
+    });
+  });
+
+  it("runs the Agent in staging and promotes a safe source change", async () => {
+    let runnerWorkspace = "";
+    const service = await makeService({
+      run: async (request) => {
+        runnerWorkspace = request.workspacePath;
+        await mkdir(path.join(request.workspacePath, "src"));
+        await writeFile(
+          path.join(request.workspacePath, "src", "safe.ts"),
+          "export const safe = true;\n",
+        );
+        return { output: "Added safe source", threadId: "safe-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Safe builder" });
+
+    const { run } = await service.sendMessage(agent.id, "add safe source");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(runnerWorkspace).not.toBe(agent.workspacePath);
+    expect(runnerWorkspace).toContain(path.join(".staging", run.id));
+    expect(await readFile(path.join(agent.workspacePath, "src", "safe.ts"), "utf8"))
+      .toBe("export const safe = true;\n");
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "promoted",
+      reason: "verified_safe",
+      changedFiles: { addedCount: 1 },
+    });
+    expect(service.getAgent(agent.id).codexThreadId).toBe("safe-thread");
+  });
+
+  it("promotes a safe change only after configured tests pass", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "source.ts"), "updated\n");
+        return { output: "Updated source", threadId: "tested-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Tested builder" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: `node -e "console.log('tests pass')"` } }),
+    );
+    await writeFile(path.join(agent.workspacePath, "source.ts"), "original\n");
+
+    const { run } = await service.sendMessage(agent.id, "update source");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "promoted",
+      verification: { status: "passed", command: "npm test" },
+    });
+    expect(await readFile(path.join(agent.workspacePath, "source.ts"), "utf8"))
+      .toBe("updated\n");
+  });
+
+  it("quarantines protected changes and leaves trusted files unchanged", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await mkdir(path.join(request.workspacePath, "deploy"));
+        await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "risk\n");
+        return { output: "Changed deployment", threadId: "risky-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Protected builder" });
+
+    const { run } = await service.sendMessage(agent.id, "change deployment");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const decision = service.getRun(run.id).runVault;
+    expect(decision).toMatchObject({
+      outcome: "quarantined",
+      reason: "protected_path",
+      changedFiles: { protectedPathsTouched: ["deploy/app.yml"] },
+    });
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      lstat(path.join(path.dirname(agent.workspacePath), ".staging", run.id)),
+    ).resolves.toBeDefined();
+    expect(service.getAgent(agent.id).codexThreadId).toBeNull();
+    expect(service.getMessages(agent.id).map((message) => message.role)).toEqual(["user"]);
+  });
+
+  it("discards staged work when verification fails", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "source.ts"), "broken\n");
+        return { output: "Changed source", threadId: "failed-test-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Broken builder" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: `node -e "process.exit(1)"` } }),
+    );
+    await writeFile(path.join(agent.workspacePath, "source.ts"), "trusted\n");
+
+    const { run } = await service.sendMessage(agent.id, "break source");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "verification_failed",
+      verification: { status: "failed" },
+    });
+    expect(await readFile(path.join(agent.workspacePath, "source.ts"), "utf8"))
+      .toBe("trusted\n");
+    await expect(
+      lstat(path.join(path.dirname(agent.workspacePath), ".staging", run.id)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(service.getAgent(agent.id).codexThreadId).toBeNull();
+  });
+
+  it("discards partial files after runner failure", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "partial.txt"), "partial\n");
+        throw new Error("runner exploded");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Failing builder" });
+
+    const { run } = await service.sendMessage(agent.id, "fail midway");
+    await expect.poll(() => service.getRun(run.id).status).toBe("failed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "run_failed",
+      changedFiles: { addedCount: 1 },
+    });
+    await expect(lstat(path.join(agent.workspacePath, "partial.txt"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("records a typed runner timeout and discards partial files", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "partial.txt"), "partial\n");
+        throw new RunTimedOutError("runner timed out");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Timed builder" });
+
+    const { run } = await service.sendMessage(agent.id, "take too long");
+    await expect.poll(() => service.getRun(run.id).status).toBe("failed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "timed_out",
+    });
+    await expect(lstat(path.join(agent.workspacePath, "partial.txt"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("cancels an active staged Run without changing trusted files", async () => {
+    let rejectRun!: (error: Error) => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "partial.txt"), "partial\n");
+        signalStarted();
+        return new Promise<RunnerResult>((_resolve, reject) => {
+          rejectRun = reject;
+        });
+      },
+      cancel: async () => {
+        rejectRun(new RunCancelledError());
+        return true;
+      },
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Cancelled builder" });
+    const { run } = await service.sendMessage(agent.id, "wait forever");
+    await started;
+
+    await service.stopAgent(agent.id);
+
+    expect(service.getRun(run.id)).toMatchObject({
+      status: "cancelled",
+      runVault: { outcome: "discarded", reason: "cancelled" },
+    });
+    await expect(lstat(path.join(agent.workspacePath, "partial.txt"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("quarantines when trusted files change while a Run is active", async () => {
+    let finish!: (result: RunnerResult) => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "source.ts"), "staged\n");
+        signalStarted();
+        return new Promise<RunnerResult>((resolve) => {
+          finish = resolve;
+        });
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Concurrent editor" });
+    const { run } = await service.sendMessage(agent.id, "edit source");
+    await started;
+    await writeFile(path.join(agent.workspacePath, "external.txt"), "external\n");
+    finish({ output: "Edited source", threadId: "provisional", usage: null });
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "trusted_workspace_changed",
+      trustedWorkspaceChanged: true,
+    });
+    expect(await readFile(path.join(agent.workspacePath, "external.txt"), "utf8"))
+      .toBe("external\n");
+    await expect(lstat(path.join(agent.workspacePath, "source.ts"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("quarantines a new symbolic link without executing verification", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "target.txt"), "target\n");
+        await symlink("target.txt", path.join(request.workspacePath, "link.txt"));
+        return { output: "Added link", threadId: "link-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Link builder" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({
+        scripts: {
+          test: `node -e "require('fs').writeFileSync('verification-marker', 'ran')"`,
+        },
+      }),
+    );
+
+    const { run } = await service.sendMessage(agent.id, "add link");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "unsafe_link",
+      verification: { status: "skipped" },
+    });
+    const stagingPath = path.join(path.dirname(agent.workspacePath), ".staging", run.id);
+    await expect(lstat(path.join(stagingPath, "verification-marker"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    await expect(lstat(path.join(agent.workspacePath, "link.txt"))).rejects
+      .toMatchObject({ code: "ENOENT" });
   });
 
   it("atomically accepts only one concurrent run per Agent", async () => {
