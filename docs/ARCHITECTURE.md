@@ -1,16 +1,22 @@
 # Architecture
 
-Volc Agent Launchpad is a single-node control plane for hackathon use.
+RunVault extends the Volc Agent Launchpad single-node control plane with a
+transactional workspace boundary for hackathon use.
 
 ```mermaid
 flowchart LR
     UI["React Web UI"] --> API["Fastify API"]
     API --> Service["AgentService"]
     Service --> Store["JSON store"]
-    Service --> Workspace["Agent workspace"]
-    Service --> Runner{"AgentRunner"}
+    Service --> Stage["RunVault staging workspace"]
+    Stage --> Runner{"AgentRunner"}
     Runner -->|Local POC| Container["Disposable Runtime container"]
     Runner -->|ECS| Process["Codex child process"]
+    Runner --> Inspect["Change inspection + verification"]
+    Inspect --> Decision{"Policy decision"}
+    Decision -->|Promote| Workspace["Trusted Agent workspace"]
+    Decision -->|Quarantine| Stage
+    Decision -->|Discard| Cleanup["Remove staged state"]
     Container --> Ark["Volcengine Ark"]
     Process --> Ark
 ```
@@ -29,8 +35,8 @@ serves the compiled Web UI. The token is not user identity or authorization.
 
 ### AgentService
 
-Coordinates lifecycle state, persistence, workspaces, and Runs. One Agent can
-have only one active Run.
+Coordinates lifecycle state, persistence, RunVault transactions, and Runs. One
+Agent can have only one active Run or quarantine-resolution operation.
 
 ```text
 ready -> busy -> ready
@@ -39,13 +45,44 @@ ready -> busy -> ready
 stopped  error
 ```
 
-Interrupted Runs become `cancelled` after a restart.
+Interrupted Runs become `cancelled` after a restart, their staging workspaces
+are discarded, and the trusted workspace remains unchanged.
+
+### RunVault workspace boundary
+
+Every Run receives `workspaces/.staging/<run-id>` instead of the trusted Agent
+workspace. RunVault fingerprints the trusted baseline, copies it with explicit
+filesystem handling, executes Codex in staging, inspects the resulting change
+set, runs configured verification, and applies deterministic policy.
+
+```text
+trusted workspace -> staging -> inspect -> verify -> decide
+                                      |          |-> promote
+                                      |          |-> quarantine
+                                      |          |-> discard
+                                      +-- trusted workspace remains isolated
+```
+
+Promotion renames the trusted workspace to a temporary backup and atomically
+installs staging on the same filesystem. A durable promotion marker and the
+persisted Run decision let startup reconciliation either finish the promotion
+or restore the backup after an interruption.
+
+RunVault copies `node_modules` when it is present. This makes verification use
+the same installed dependencies as the trusted workspace and avoids network
+installation during a Run. The trade-off is additional copy time and disk use;
+the POC favors repeatable verification over snapshot speed.
+
+New symbolic links are quarantined before verification. Verification invokes
+only the configured `npm test` command, with a scrubbed environment, bounded
+output, and a timeout. Test output stored in Run evidence is redacted.
 
 ### Storage
 
 ```text
 data/launchpad.json       Agent, message, and Run metadata
-workspaces/AgentID/       Agent-created files
+workspaces/AgentID/       Trusted, promoted Agent files
+workspaces/.staging/      Provisional Runs, backups, and promotion markers
 workspaces/.deleted/      Archived deleted workspaces
 codex-home/               Codex configuration and sessions
 ```
@@ -61,8 +98,8 @@ one process only.
 
 Both providers use argv-only process execution, bound output and time, fork
 from the last promoted Codex thread, and escalate termination after a grace
-period. A fork becomes the Agent's committed thread only when its staged
-workspace is promoted.
+period. A fork remains provisional while its workspace is staged and becomes
+the Agent's committed thread only when RunVault promotes that workspace.
 
 ## Deployment profiles
 
