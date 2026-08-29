@@ -303,6 +303,9 @@ export class AgentService {
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
       });
+      if (runnerResult.threadId === agentAtStart.codexThreadId) {
+        throw new Error("Codex did not create a distinct provisional thread");
+      }
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }

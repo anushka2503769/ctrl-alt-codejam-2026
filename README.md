@@ -96,8 +96,8 @@ In the Web UI:
    Create a TypeScript hello-world CLI, add a test, and run it.
    ```
 
-The Agent can write files, run commands, and continue the same Codex session in
-later messages.
+The Agent can write files and run commands. Later messages fork from the last
+promoted Codex session, keeping discarded or quarantined context provisional.
 
 ### 5. Stop and resume
 
@@ -159,7 +159,7 @@ docker compose down
 ```bash
 npm install
 cp .env.example .env
-npm install --global @openai/codex@0.111.0
+npm install --global @openai/codex@0.150.1
 npm run dev
 ```
 
@@ -223,7 +223,9 @@ flowchart LR
     Codex --> Ark
 ```
 
-The first turn uses `codex exec`; later turns resume the stored Codex thread.
+The first turn uses `codex exec`. Later turns use `codex exec fork` from the
+last promoted thread so discarded or quarantined Runs cannot alter committed
+conversation state.
 Deleting an Agent archives its workspace under `workspaces/.deleted/`.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for component and extension

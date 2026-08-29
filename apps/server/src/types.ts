@@ -117,7 +117,7 @@ export interface UpdateAgentInput {
 
 export interface RunnerResult {
   output: string;
-  threadId: string | null;
+  threadId: string;
   usage: RunUsage | null;
 }
 

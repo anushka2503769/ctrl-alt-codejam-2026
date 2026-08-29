@@ -24,7 +24,7 @@ describe("Codex runner protocol", () => {
     ]);
   });
 
-  it("resumes a stored Codex thread", () => {
+  it("forks a stored committed Codex thread", () => {
     const args = buildCodexArgs(
       {
         agentId: "agent",
@@ -34,7 +34,8 @@ describe("Codex runner protocol", () => {
       },
       "workspace-write",
     );
-    expect(args.slice(-3)).toEqual(["resume", "thread-123", "add tests"]);
+    expect(args.slice(-3)).toEqual(["fork", "thread-123", "add tests"]);
+    expect(args).not.toContain("resume");
   });
 
   it("extracts the session, final message and usage", () => {
