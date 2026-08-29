@@ -14,3 +14,10 @@ export class RunCancelledError extends Error {
     this.name = "RunCancelledError";
   }
 }
+
+export class RunTimedOutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunTimedOutError";
+  }
+}

@@ -1,7 +1,21 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
-import { HttpError, RunCancelledError } from "./errors.js";
+import {
+  HttpError,
+  RunCancelledError,
+  RunTimedOutError,
+} from "./errors.js";
+import {
+  evaluateRunVaultPolicy,
+  type RunVaultExecutionStatus,
+} from "./runvault-policy.js";
+import { RunVaultVerifier } from "./runvault-verifier.js";
+import {
+  RunVaultWorkspaceManager,
+  TrustedWorkspaceChangedError,
+  type StagingWorkspace,
+} from "./runvault-workspace.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
@@ -9,26 +23,52 @@ import type {
   AgentRunner,
   CreateAgentInput,
   Message,
+  RunVaultDecision,
+  RunVaultFileChange,
+  RunVaultVerification,
+  RunnerResult,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
+const skippedVerification = (summary: string): RunVaultVerification => ({
+  status: "skipped",
+  command: null,
+  redactedSummary: summary,
+});
+
+function verificationEvidence(
+  verification: RunVaultVerification,
+): RunVaultVerification {
+  return {
+    status: verification.status,
+    command: verification.command,
+    redactedSummary: verification.redactedSummary,
+  };
+}
+
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
+  private readonly verificationControllers = new Map<string, AbortController>();
 
   constructor(
     private readonly config: AppConfig,
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    private readonly runVaultWorkspaces = new RunVaultWorkspaceManager(
+      config.workspaceRoot,
+    ),
+    private readonly verifier = new RunVaultVerifier(),
   ) {}
 
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
+    await this.runVaultWorkspaces.initialize();
     await this.store.mutate((database) => {
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
@@ -241,48 +281,208 @@ export class AgentService {
         storedRun.startedAt = now();
       }
     });
+    let staging: StagingWorkspace | null = null;
+    let runnerResult: RunnerResult | null = null;
+    let verification = skippedVerification(
+      "Verification was not run because Agent execution did not complete.",
+    );
     try {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
-      const result = await this.runner.run({
+      staging = await this.runVaultWorkspaces.createStagingWorkspace(
+        run.id,
+        agentAtStart.workspacePath,
+      );
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+      runnerResult = await this.runner.run({
         agentId: agentAtStart.id,
-        workspacePath: agentAtStart.workspacePath,
+        workspacePath: staging.path,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
       });
-      const completedAt = now();
-      await this.store.mutate((database) => {
-        const storedRun = database.runs.find((item) => item.id === run.id);
-        const agent = database.agents.find((item) => item.id === agentAtStart.id);
-        if (!storedRun || !agent) return;
-        storedRun.status = "completed";
-        storedRun.output = result.output;
-        storedRun.usage = result.usage;
-        storedRun.completedAt = completedAt;
-        database.messages.push({
-          id: randomUUID(),
-          agentId: agent.id,
-          runId: run.id,
-          role: "assistant",
-          content: result.output,
-          createdAt: completedAt,
-        });
-        agent.status = "ready";
-        agent.codexThreadId = result.threadId;
-        agent.lastError = null;
-        agent.updatedAt = completedAt;
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+
+      const beforeVerification = await this.runVaultWorkspaces.inspectChanges(
+        staging.trustedSnapshot,
+        staging.path,
+      );
+      if (beforeVerification.changes.some((change) => change.symbolicLink)) {
+        verification = skippedVerification(
+          "Verification was skipped because the staged workspace introduced a symbolic link.",
+        );
+      } else {
+        const controller = new AbortController();
+        this.verificationControllers.set(agentAtStart.id, controller);
+        try {
+          verification = verificationEvidence(
+            await this.verifier.verify(staging.path, controller.signal),
+          );
+        } finally {
+          if (this.verificationControllers.get(agentAtStart.id) === controller) {
+            this.verificationControllers.delete(agentAtStart.id);
+          }
+        }
+      }
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+
+      const inspection = await this.runVaultWorkspaces.inspectChanges(
+        staging.trustedSnapshot,
+        staging.path,
+      );
+      const currentTrusted = await this.runVaultWorkspaces.snapshotWorkspace(
+        agentAtStart.workspacePath,
+      );
+      let policy = evaluateRunVaultPolicy({
+        executionStatus: "succeeded",
+        verificationStatus: verification.status,
+        changes: inspection.changes,
+        trustedWorkspaceChanged:
+          currentTrusted.fingerprint !== staging.trustedSnapshot.fingerprint,
       });
+      let decision: RunVaultDecision = {
+        outcome: policy.outcome,
+        reason: policy.reason,
+        stagingWorkspaceId: staging.id,
+        provisionalThreadId: runnerResult.threadId,
+        changedFiles: policy.changedFiles,
+        verification,
+        trustedWorkspaceChanged:
+          currentTrusted.fingerprint !== staging.trustedSnapshot.fingerprint,
+        decidedAt: now(),
+      };
+
+      if (policy.outcome === "promoted") {
+        if (this.cancellationRequests.has(agentAtStart.id)) {
+          throw new RunCancelledError();
+        }
+        let promotion;
+        try {
+          promotion = await this.runVaultWorkspaces.beginPromotion(
+            staging.id,
+            agentAtStart.workspacePath,
+            staging.trustedSnapshot.fingerprint,
+          );
+        } catch (error) {
+          if (!(error instanceof TrustedWorkspaceChangedError)) throw error;
+          policy = evaluateRunVaultPolicy({
+            executionStatus: "succeeded",
+            verificationStatus: verification.status,
+            changes: inspection.changes,
+            trustedWorkspaceChanged: true,
+          });
+          decision = {
+            ...decision,
+            outcome: policy.outcome,
+            reason: policy.reason,
+            changedFiles: policy.changedFiles,
+            trustedWorkspaceChanged: true,
+            decidedAt: now(),
+          };
+        }
+
+        if (promotion) {
+          try {
+            if (this.cancellationRequests.has(agentAtStart.id)) {
+              throw new RunCancelledError();
+            }
+            await this.persistCompletedRun(
+              agentAtStart,
+              run,
+              runnerResult,
+              decision,
+              true,
+            );
+          } catch (error) {
+            await this.runVaultWorkspaces.rollbackPromotion(promotion);
+            throw error;
+          }
+          await this.runVaultWorkspaces.finalizePromotion(promotion).catch(
+            () => undefined,
+          );
+          return;
+        }
+      }
+
+      await this.persistCompletedRun(
+        agentAtStart,
+        run,
+        runnerResult,
+        decision,
+        false,
+      );
+      if (decision.outcome === "discarded") {
+        await this.runVaultWorkspaces
+          .discardStagingWorkspace(staging.id)
+          .catch(() => undefined);
+      }
     } catch (error) {
       const completedAt = now();
-      const cancelled = error instanceof RunCancelledError;
+      const cancelled =
+        error instanceof RunCancelledError ||
+        this.cancellationRequests.has(agentAtStart.id);
+      const timedOut = error instanceof RunTimedOutError;
       const message = error instanceof Error ? error.message : String(error);
+      let changes: RunVaultFileChange[] = [];
+      let trustedWorkspaceChanged = false;
+      if (staging) {
+        try {
+          changes = (
+            await this.runVaultWorkspaces.inspectChanges(
+              staging.trustedSnapshot,
+              staging.path,
+            )
+          ).changes;
+        } catch {
+          changes = [];
+        }
+        try {
+          trustedWorkspaceChanged =
+            (
+              await this.runVaultWorkspaces.snapshotWorkspace(
+                agentAtStart.workspacePath,
+              )
+            ).fingerprint !== staging.trustedSnapshot.fingerprint;
+        } catch {
+          trustedWorkspaceChanged = false;
+        }
+      }
+      const executionStatus: RunVaultExecutionStatus = cancelled
+        ? "cancelled"
+        : timedOut
+          ? "timed_out"
+          : "failed";
+      const policy = evaluateRunVaultPolicy({
+        executionStatus,
+        verificationStatus: verification.status,
+        changes,
+        trustedWorkspaceChanged,
+      });
+      const decision: RunVaultDecision = {
+        outcome: policy.outcome,
+        reason: policy.reason,
+        stagingWorkspaceId: staging?.id ?? null,
+        provisionalThreadId: runnerResult?.threadId ?? null,
+        changedFiles: policy.changedFiles,
+        verification,
+        trustedWorkspaceChanged,
+        decidedAt: completedAt,
+      };
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
         if (storedRun) {
           storedRun.status = cancelled ? "cancelled" : "failed";
+          storedRun.output = runnerResult?.output ?? null;
+          storedRun.usage = runnerResult?.usage ?? null;
           storedRun.error = message;
+          storedRun.runVault = decision;
           storedRun.completedAt = completedAt;
         }
         if (agent) {
@@ -293,7 +493,46 @@ export class AgentService {
           agent.updatedAt = completedAt;
         }
       });
+      if (staging) {
+        await this.runVaultWorkspaces
+          .discardStagingWorkspace(staging.id)
+          .catch(() => undefined);
+      }
     }
+  }
+
+  private async persistCompletedRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    result: RunnerResult,
+    decision: RunVaultDecision,
+    promoted: boolean,
+  ): Promise<void> {
+    const completedAt = now();
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === run.id);
+      const agent = database.agents.find((item) => item.id === agentAtStart.id);
+      if (!storedRun || !agent) return;
+      storedRun.status = "completed";
+      storedRun.output = result.output;
+      storedRun.usage = result.usage;
+      storedRun.runVault = decision;
+      storedRun.completedAt = completedAt;
+      if (promoted) {
+        database.messages.push({
+          id: randomUUID(),
+          agentId: agent.id,
+          runId: run.id,
+          role: "assistant",
+          content: result.output,
+          createdAt: completedAt,
+        });
+        agent.codexThreadId = result.threadId;
+      }
+      agent.status = "ready";
+      agent.lastError = null;
+      agent.updatedAt = completedAt;
+    });
   }
 
   private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {
@@ -315,6 +554,7 @@ export class AgentService {
   private async cancelExecution(agentId: string): Promise<void> {
     this.cancellationRequests.add(agentId);
     try {
+      this.verificationControllers.get(agentId)?.abort();
       await this.runner.cancel(agentId);
       const execution = this.activeExecutions.get(agentId);
       if (execution) {

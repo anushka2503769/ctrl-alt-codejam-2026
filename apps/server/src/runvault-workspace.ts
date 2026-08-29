@@ -7,6 +7,7 @@ import {
   mkdir,
   readlink,
   readdir,
+  rename,
   rm,
   symlink,
 } from "node:fs/promises";
@@ -85,7 +86,15 @@ export interface RunVaultWorkspaceInspection {
   stagingFingerprint: string;
 }
 
+export interface RunVaultPromotion {
+  id: string;
+  trustedWorkspacePath: string;
+  stagingWorkspacePath: string;
+  backupWorkspacePath: string;
+}
+
 export class UnsafeWorkspaceEntryError extends Error {}
+export class TrustedWorkspaceChangedError extends Error {}
 
 function isInside(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -407,5 +416,57 @@ export class RunVaultWorkspaceManager {
 
   async discardStagingWorkspace(id: string): Promise<void> {
     await rm(this.stagingPath(id), { recursive: true, force: true });
+  }
+
+  async beginPromotion(
+    id: string,
+    trustedWorkspacePath: string,
+    expectedTrustedFingerprint: string,
+  ): Promise<RunVaultPromotion> {
+    const stagingWorkspacePath = this.stagingPath(id);
+    const trustedPath = path.resolve(trustedWorkspacePath);
+    if (
+      !isInside(this.workspaceRoot, trustedPath) ||
+      trustedPath === this.workspaceRoot ||
+      isInside(this.stagingRoot, trustedPath)
+    ) {
+      throw new Error("Trusted workspace path is outside the managed workspace root");
+    }
+    const current = await this.snapshotWorkspace(trustedPath);
+    if (current.fingerprint !== expectedTrustedFingerprint) {
+      throw new TrustedWorkspaceChangedError(
+        "Trusted workspace changed before promotion",
+      );
+    }
+
+    const backupWorkspacePath = path.join(this.stagingRoot, `${id}.backup`);
+    await rename(trustedPath, backupWorkspacePath);
+    try {
+      await rename(stagingWorkspacePath, trustedPath);
+    } catch (error) {
+      await rename(backupWorkspacePath, trustedPath);
+      throw error;
+    }
+    return {
+      id,
+      trustedWorkspacePath: trustedPath,
+      stagingWorkspacePath,
+      backupWorkspacePath,
+    };
+  }
+
+  async rollbackPromotion(promotion: RunVaultPromotion): Promise<void> {
+    await rename(
+      promotion.trustedWorkspacePath,
+      promotion.stagingWorkspacePath,
+    );
+    await rename(
+      promotion.backupWorkspacePath,
+      promotion.trustedWorkspacePath,
+    );
+  }
+
+  async finalizePromotion(promotion: RunVaultPromotion): Promise<void> {
+    await rm(promotion.backupWorkspacePath, { recursive: true, force: true });
   }
 }

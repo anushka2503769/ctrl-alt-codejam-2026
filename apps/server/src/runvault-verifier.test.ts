@@ -2,6 +2,7 @@ import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { RunCancelledError } from "./errors.js";
 import {
   redactVerificationOutput,
   RunVaultVerifier,
@@ -110,6 +111,19 @@ describe("RunVaultVerifier", () => {
 
     expect(result).toMatchObject({ status: "failed", timedOut: true });
     expect(result.redactedSummary).toContain("timed out after 100 ms");
+  });
+
+  it("terminates verification when the Run is cancelled", async () => {
+    await writePackage(`node -e "setInterval(() => {}, 1000)"`);
+    const controller = new AbortController();
+    const verification = new RunVaultVerifier({ timeoutMs: 10_000 }).verify(
+      workspace,
+      controller.signal,
+    );
+
+    setTimeout(() => controller.abort(), 100);
+
+    await expect(verification).rejects.toBeInstanceOf(RunCancelledError);
   });
 
   it("bounds retained output", async () => {
