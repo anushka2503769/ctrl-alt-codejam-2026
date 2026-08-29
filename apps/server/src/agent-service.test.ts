@@ -75,6 +75,11 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
   return (await makeServiceHarness(runner)).service;
 }
 
+async function trustedFingerprint(workspacePath: string): Promise<string> {
+  const manager = new RunVaultWorkspaceManager(path.dirname(workspacePath));
+  return (await manager.snapshotWorkspace(workspacePath)).fingerprint;
+}
+
 describe("Agent lifecycle", () => {
   it("creates, updates, stops, starts and deletes an Agent", async () => {
     const service = await makeService();
@@ -252,6 +257,124 @@ describe("Agent lifecycle", () => {
     });
     expect(await readFile(path.join(agent.workspacePath, "source.ts"), "utf8"))
       .toBe("updated\n");
+  });
+
+  it("promotes a safe documentation-only change", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(
+          path.join(request.workspacePath, "README.md"),
+          "# Generated documentation\n",
+        );
+        return { output: "Added documentation", threadId: "docs-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Documentation builder" });
+
+    const { run } = await service.sendMessage(agent.id, "document this workspace");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "promoted",
+      reason: "verified_safe",
+      verification: { status: "skipped" },
+    });
+    expect(await readFile(path.join(agent.workspacePath, "README.md"), "utf8"))
+      .toBe("# Generated documentation\n");
+  });
+
+  it("quarantines a secret-like file without persisting its contents", async () => {
+    const secret = "RUNVAULT_TEST_SECRET=never-expose-this-value\n";
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, ".env"), secret);
+        return { output: "Prepared local config", threadId: "secret-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Secret-aware builder" });
+    const before = await trustedFingerprint(agent.workspacePath);
+
+    const { run } = await service.sendMessage(agent.id, "prepare local secrets");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const completed = service.getRun(run.id);
+    expect(completed.runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "protected_path",
+      changedFiles: { protectedPathsTouched: [".env"] },
+    });
+    expect(JSON.stringify(completed.runVault)).not.toContain("never-expose-this-value");
+    expect(await trustedFingerprint(agent.workspacePath)).toBe(before);
+    await expect(lstat(path.join(agent.workspacePath, ".env"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("quarantines a Run that exceeds the changed-file limit", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await Promise.all(
+          Array.from({ length: 21 }, (_, index) =>
+            writeFile(
+              path.join(request.workspacePath, `generated-${index}.ts`),
+              `export const generated${index} = true;\n`,
+            ),
+          ),
+        );
+        return { output: "Generated files", threadId: "large-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Bounded builder" });
+    const before = await trustedFingerprint(agent.workspacePath);
+
+    const { run } = await service.sendMessage(agent.id, "generate many files");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "change_limit_exceeded",
+      changedFiles: { addedCount: 21 },
+    });
+    expect(await trustedFingerprint(agent.workspacePath)).toBe(before);
+    await expect(lstat(path.join(agent.workspacePath, "generated-0.ts"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("quarantines dependency metadata without changing trusted files", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(
+          path.join(request.workspacePath, "package-lock.json"),
+          JSON.stringify({ lockfileVersion: 3 }),
+        );
+        return {
+          output: "Prepared dependency metadata",
+          threadId: "dependency-thread",
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Dependency builder" });
+    const before = await trustedFingerprint(agent.workspacePath);
+
+    const { run } = await service.sendMessage(agent.id, "update dependencies");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "dependency_change",
+      changedFiles: { addedCount: 1 },
+    });
+    expect(await trustedFingerprint(agent.workspacePath)).toBe(before);
+    await expect(lstat(path.join(agent.workspacePath, "package-lock.json"))).rejects
+      .toMatchObject({ code: "ENOENT" });
   });
 
   it("quarantines protected changes and leaves trusted files unchanged", async () => {
