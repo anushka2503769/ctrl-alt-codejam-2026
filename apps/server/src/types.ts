@@ -19,6 +19,10 @@ export type RunVaultReason =
 
 export type RunVaultVerificationStatus = "passed" | "failed" | "skipped";
 export type RunVaultChangeKind = "added" | "modified" | "deleted";
+export type RunVaultResolution =
+  | "policy"
+  | "human_approved"
+  | "human_discarded";
 
 export interface RunVaultFileChange {
   path: string;
@@ -46,8 +50,11 @@ export interface RunVaultVerification {
 export interface RunVaultDecision {
   outcome: RunVaultOutcome;
   reason: RunVaultReason;
+  resolution: RunVaultResolution;
   stagingWorkspaceId: string | null;
   provisionalThreadId: string | null;
+  trustedWorkspaceFingerprint: string | null;
+  stagingWorkspaceFingerprint: string | null;
   changedFiles: RunVaultChangeSummary;
   verification: RunVaultVerification;
   trustedWorkspaceChanged: boolean;

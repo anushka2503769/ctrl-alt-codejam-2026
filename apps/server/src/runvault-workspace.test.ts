@@ -120,6 +120,8 @@ describe("RunVaultWorkspaceManager", () => {
     [".env", true],
     [".env.local", true],
     ["AGENTS.md", true],
+    [".codex/session.json", true],
+    [".staging/nested", true],
     [".github/workflows/release.yml", true],
     ["infra/main.tf", true],
     ["deploy/app.yaml", true],
@@ -150,6 +152,25 @@ describe("RunVaultWorkspaceManager", () => {
     );
     expect(inspection.changes).toEqual([
       expect.objectContaining({ path: "artifact.dat", binary: true, kind: "added" }),
+    ]);
+  });
+
+  it("inspects reserved metadata created after staging", async () => {
+    const staging = await stage();
+    await mkdir(path.join(staging.path, ".codex"));
+    await writeFile(path.join(staging.path, ".codex", "session.json"), "agent state\n");
+
+    const inspection = await manager.inspectChanges(
+      staging.trustedSnapshot,
+      staging.path,
+    );
+
+    expect(inspection.changes).toEqual([
+      expect.objectContaining({
+        path: ".codex/session.json",
+        kind: "added",
+        protected: true,
+      }),
     ]);
   });
 

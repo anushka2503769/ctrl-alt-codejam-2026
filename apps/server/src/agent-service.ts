@@ -14,6 +14,7 @@ import { RunVaultVerifier } from "./runvault-verifier.js";
 import {
   RunVaultWorkspaceManager,
   TrustedWorkspaceChangedError,
+  type RunVaultPromotion,
   type StagingWorkspace,
 } from "./runvault-workspace.js";
 import { JsonStore } from "./store.js";
@@ -50,7 +51,7 @@ function verificationEvidence(
 }
 
 export class AgentService {
-  private readonly activeExecutions = new Map<string, Promise<void>>();
+  private readonly activeExecutions = new Map<string, Promise<unknown>>();
   private readonly cancellationRequests = new Set<string>();
   private readonly verificationControllers = new Map<string, AbortController>();
 
@@ -147,6 +148,22 @@ export class AgentService {
   async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
     const agent = this.getAgent(id);
     await this.cancelExecution(id);
+    const retainedStagingIds = this.store
+      .snapshot()
+      .runs.filter(
+        (run) =>
+          run.agentId === id && run.runVault?.outcome === "quarantined",
+      )
+      .flatMap((run) =>
+        run.runVault?.stagingWorkspaceId
+          ? [run.runVault.stagingWorkspaceId]
+          : [],
+      );
+    await Promise.all(
+      retainedStagingIds.map((stagingId) =>
+        this.runVaultWorkspaces.discardStagingWorkspace(stagingId),
+      ),
+    );
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
       database.agents = database.agents.filter((item) => item.id !== id);
@@ -188,6 +205,107 @@ export class AgentService {
       .snapshot()
       .runs.filter((run) => run.agentId === agentId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async approveRun(runId: string): Promise<AgentRun> {
+    const reservation = await this.store.mutate((database) => {
+      const run = database.runs.find((item) => item.id === runId);
+      if (!run) throw new HttpError(404, "Run not found");
+      if (
+        run.runVault?.outcome === "promoted" &&
+        run.runVault.resolution === "human_approved"
+      ) {
+        return { completed: structuredClone(run) } as const;
+      }
+      if (
+        run.runVault?.outcome === "discarded" &&
+        run.runVault.resolution === "human_discarded"
+      ) {
+        throw new HttpError(409, "This quarantined Run was already discarded");
+      }
+      if (run.runVault?.outcome !== "quarantined") {
+        throw new HttpError(409, "Only a quarantined Run can be approved");
+      }
+      const agent = database.agents.find((item) => item.id === run.agentId);
+      if (!agent) throw new HttpError(404, "Agent not found");
+      if (agent.status === "busy") {
+        throw new HttpError(409, "Wait for the active Agent operation to finish");
+      }
+      const decision = run.runVault;
+      if (
+        !decision.stagingWorkspaceId ||
+        !decision.provisionalThreadId ||
+        !decision.trustedWorkspaceFingerprint ||
+        !decision.stagingWorkspaceFingerprint ||
+        !run.output
+      ) {
+        throw new HttpError(
+          409,
+          "This quarantined Run is missing promotion evidence and cannot be approved",
+        );
+      }
+      const previousStatus = agent.status;
+      agent.status = "busy";
+      agent.updatedAt = now();
+      return {
+        run: structuredClone(run),
+        agent: structuredClone(agent),
+        previousStatus,
+      } as const;
+    });
+    if ("completed" in reservation) return reservation.completed;
+
+    const operation = this.promoteQuarantinedRun(
+      reservation.run,
+      reservation.agent,
+      reservation.previousStatus,
+    );
+    this.activeExecutions.set(reservation.agent.id, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.activeExecutions.get(reservation.agent.id) === operation) {
+        this.activeExecutions.delete(reservation.agent.id);
+      }
+    }
+  }
+
+  async discardRun(runId: string): Promise<AgentRun> {
+    const updated = await this.store.mutate((database) => {
+      const run = database.runs.find((item) => item.id === runId);
+      if (!run) throw new HttpError(404, "Run not found");
+      if (
+        run.runVault?.outcome === "discarded" &&
+        run.runVault.resolution === "human_discarded"
+      ) {
+        return structuredClone(run);
+      }
+      if (
+        run.runVault?.outcome === "promoted" &&
+        run.runVault.resolution === "human_approved"
+      ) {
+        throw new HttpError(409, "This quarantined Run was already approved");
+      }
+      if (run.runVault?.outcome !== "quarantined") {
+        throw new HttpError(409, "Only a quarantined Run can be discarded");
+      }
+      const agent = database.agents.find((item) => item.id === run.agentId);
+      if (!agent) throw new HttpError(404, "Agent not found");
+      if (agent.status === "busy") {
+        throw new HttpError(409, "Wait for the active Agent operation to finish");
+      }
+      run.runVault.outcome = "discarded";
+      run.runVault.resolution = "human_discarded";
+      run.runVault.decidedAt = now();
+      return structuredClone(run);
+    });
+    const stagingId = updated.runVault?.stagingWorkspaceId;
+    if (stagingId) {
+      await this.runVaultWorkspaces
+        .discardStagingWorkspace(stagingId)
+        .catch(() => undefined);
+    }
+    return updated;
   }
 
   async sendMessage(
@@ -352,8 +470,11 @@ export class AgentService {
       let decision: RunVaultDecision = {
         outcome: policy.outcome,
         reason: policy.reason,
+        resolution: "policy",
         stagingWorkspaceId: staging.id,
         provisionalThreadId: runnerResult.threadId,
+        trustedWorkspaceFingerprint: staging.trustedSnapshot.fingerprint,
+        stagingWorkspaceFingerprint: inspection.stagingFingerprint,
         changedFiles: policy.changedFiles,
         verification,
         trustedWorkspaceChanged:
@@ -433,15 +554,16 @@ export class AgentService {
       const timedOut = error instanceof RunTimedOutError;
       const message = error instanceof Error ? error.message : String(error);
       let changes: RunVaultFileChange[] = [];
+      let stagingWorkspaceFingerprint: string | null = null;
       let trustedWorkspaceChanged = false;
       if (staging) {
         try {
-          changes = (
-            await this.runVaultWorkspaces.inspectChanges(
-              staging.trustedSnapshot,
-              staging.path,
-            )
-          ).changes;
+          const inspection = await this.runVaultWorkspaces.inspectChanges(
+            staging.trustedSnapshot,
+            staging.path,
+          );
+          changes = inspection.changes;
+          stagingWorkspaceFingerprint = inspection.stagingFingerprint;
         } catch {
           changes = [];
         }
@@ -470,8 +592,12 @@ export class AgentService {
       const decision: RunVaultDecision = {
         outcome: policy.outcome,
         reason: policy.reason,
+        resolution: "policy",
         stagingWorkspaceId: staging?.id ?? null,
         provisionalThreadId: runnerResult?.threadId ?? null,
+        trustedWorkspaceFingerprint:
+          staging?.trustedSnapshot.fingerprint ?? null,
+        stagingWorkspaceFingerprint,
         changedFiles: policy.changedFiles,
         verification,
         trustedWorkspaceChanged,
@@ -535,6 +661,143 @@ export class AgentService {
       agent.status = "ready";
       agent.lastError = null;
       agent.updatedAt = completedAt;
+    });
+  }
+
+  private async promoteQuarantinedRun(
+    runAtStart: AgentRun,
+    agentAtStart: Agent,
+    previousStatus: Agent["status"],
+  ): Promise<AgentRun> {
+    const decision = runAtStart.runVault;
+    if (
+      !decision ||
+      !decision.stagingWorkspaceId ||
+      !decision.provisionalThreadId ||
+      !decision.trustedWorkspaceFingerprint ||
+      !decision.stagingWorkspaceFingerprint ||
+      !runAtStart.output
+    ) {
+      await this.releaseDecisionReservation(agentAtStart.id, previousStatus);
+      throw new HttpError(409, "Quarantined Run evidence is incomplete");
+    }
+
+    let promotion: RunVaultPromotion | null = null;
+    try {
+      let stagedSnapshot;
+      try {
+        stagedSnapshot = await this.runVaultWorkspaces.snapshotWorkspace(
+          this.runVaultWorkspaces.stagingPath(decision.stagingWorkspaceId),
+        );
+      } catch {
+        throw new HttpError(
+          409,
+          "Quarantined staging workspace is unavailable or unreadable",
+        );
+      }
+      if (stagedSnapshot.fingerprint !== decision.stagingWorkspaceFingerprint) {
+        throw new HttpError(
+          409,
+          "Quarantined staging files changed after inspection; discard this Run",
+        );
+      }
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+      promotion = await this.runVaultWorkspaces.beginPromotion(
+        decision.stagingWorkspaceId,
+        agentAtStart.workspacePath,
+        decision.trustedWorkspaceFingerprint,
+      );
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+
+      const completedAt = now();
+      const updated = await this.store.mutate((database) => {
+        const run = database.runs.find((item) => item.id === runAtStart.id);
+        const agent = database.agents.find((item) => item.id === agentAtStart.id);
+        if (!run || !agent) throw new HttpError(404, "Run or Agent not found");
+        if (run.runVault?.outcome !== "quarantined") {
+          throw new HttpError(409, "RunVault decision changed during approval");
+        }
+        run.runVault.outcome = "promoted";
+        run.runVault.resolution = "human_approved";
+        run.runVault.decidedAt = completedAt;
+        agent.codexThreadId = decision.provisionalThreadId;
+        agent.status = previousStatus === "stopped" ? "stopped" : "ready";
+        agent.lastError = null;
+        agent.updatedAt = completedAt;
+        if (
+          !database.messages.some(
+            (message) => message.runId === run.id && message.role === "assistant",
+          )
+        ) {
+          database.messages.push({
+            id: randomUUID(),
+            agentId: agent.id,
+            runId: run.id,
+            role: "assistant",
+            content: runAtStart.output as string,
+            createdAt: completedAt,
+          });
+        }
+        return structuredClone(run);
+      });
+      await this.runVaultWorkspaces.finalizePromotion(promotion).catch(
+        () => undefined,
+      );
+      return updated;
+    } catch (error) {
+      if (promotion) {
+        try {
+          await this.runVaultWorkspaces.rollbackPromotion(promotion);
+        } catch (rollbackError) {
+          throw new Error("RunVault could not roll back a failed approval", {
+            cause: rollbackError,
+          });
+        }
+      }
+      const trustedChanged = error instanceof TrustedWorkspaceChangedError;
+      await this.store.mutate((database) => {
+        const run = database.runs.find((item) => item.id === runAtStart.id);
+        const agent = database.agents.find((item) => item.id === agentAtStart.id);
+        if (trustedChanged && run?.runVault?.outcome === "quarantined") {
+          run.runVault.reason = "trusted_workspace_changed";
+          run.runVault.trustedWorkspaceChanged = true;
+          run.runVault.decidedAt = now();
+        }
+        if (agent?.status === "busy") {
+          agent.status = previousStatus === "stopped" ? "stopped" : "ready";
+          agent.updatedAt = now();
+        }
+      });
+      if (trustedChanged) {
+        throw new HttpError(
+          409,
+          "Trusted workspace changed after quarantine; approval was not applied",
+        );
+      }
+      if (error instanceof RunCancelledError) {
+        throw new HttpError(409, "Run approval was cancelled");
+      }
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new HttpError(409, "Trusted workspace is unavailable");
+      }
+      throw error;
+    }
+  }
+
+  private async releaseDecisionReservation(
+    agentId: string,
+    previousStatus: Agent["status"],
+  ): Promise<void> {
+    await this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (agent?.status === "busy") {
+        agent.status = previousStatus === "stopped" ? "stopped" : "ready";
+        agent.updatedAt = now();
+      }
     });
   }
 
