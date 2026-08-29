@@ -168,7 +168,7 @@ export class ContainerCodexRunner implements AgentRunner {
 
     const parsed: ParsedEvents = {
       messages: [],
-      threadId: request.threadId,
+      threadId: null,
       usage: null,
       errors: [],
     };
@@ -230,6 +230,9 @@ export class ContainerCodexRunner implements AgentRunner {
       }
       const output = parsed.messages.at(-1)?.trim();
       if (!output) throw new Error("Codex completed without an agent message");
+      if (!parsed.threadId) {
+        throw new Error("Codex completed without a provisional thread ID");
+      }
       return { output, threadId: parsed.threadId, usage: parsed.usage };
     } finally {
       clearTimeout(timeout);

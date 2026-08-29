@@ -34,7 +34,7 @@ export function buildCodexArgs(
     workspacePath,
   ];
   if (request.threadId) {
-    args.push("resume", request.threadId, request.prompt);
+    args.push("fork", request.threadId, request.prompt);
   } else {
     args.push(request.prompt);
   }
@@ -151,7 +151,7 @@ export class CodexRunner implements AgentRunner {
 
     const parsed: ParsedEvents = {
       messages: [],
-      threadId: request.threadId,
+      threadId: null,
       usage: null,
       errors: [],
     };
@@ -216,6 +216,9 @@ export class CodexRunner implements AgentRunner {
       const output = parsed.messages.at(-1)?.trim();
       if (!output) {
         throw new Error("Codex completed without an agent message");
+      }
+      if (!parsed.threadId) {
+        throw new Error("Codex completed without a provisional thread ID");
       }
       return {
         output,

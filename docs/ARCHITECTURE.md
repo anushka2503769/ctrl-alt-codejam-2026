@@ -59,8 +59,10 @@ one process only.
 - `ContainerCodexRunner` starts one disposable Docker, Colima, or Podman
   container for every local turn.
 
-Both providers use argv-only process execution, bound output and time, resume
-the stored Codex thread, and escalate termination after a grace period.
+Both providers use argv-only process execution, bound output and time, fork
+from the last promoted Codex thread, and escalate termination after a grace
+period. A fork becomes the Agent's committed thread only when its staged
+workspace is promoted.
 
 ## Deployment profiles
 

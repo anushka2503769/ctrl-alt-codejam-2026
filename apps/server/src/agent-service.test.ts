@@ -92,6 +92,98 @@ describe("Agent lifecycle", () => {
     });
   });
 
+  it("forks only from the last promoted thread after a discarded Run", async () => {
+    const baseThreadIds: Array<string | null> = [];
+    let call = 0;
+    const service = await makeService({
+      run: async (request) => {
+        baseThreadIds.push(request.threadId);
+        call += 1;
+        if (call === 2) {
+          await writeFile(path.join(request.workspacePath, "discarded.ts"), "discarded\n");
+        }
+        return {
+          output: `Result ${call}`,
+          threadId: `provisional-thread-${call}`,
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Threaded builder" });
+
+    const first = await service.sendMessage(agent.id, "first safe run");
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
+    expect(service.getAgent(agent.id).codexThreadId).toBe("provisional-thread-1");
+
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: `node -e "process.exit(1)"` } }),
+    );
+    const second = await service.sendMessage(agent.id, "discard this run");
+    await expect.poll(() => service.getRun(second.run.id).status).toBe("completed");
+    expect(service.getRun(second.run.id).runVault).toMatchObject({
+      outcome: "discarded",
+      provisionalThreadId: "provisional-thread-2",
+    });
+    expect(service.getAgent(agent.id).codexThreadId).toBe("provisional-thread-1");
+
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: `node -e "process.exit(0)"` } }),
+    );
+    const third = await service.sendMessage(agent.id, "next safe run");
+    await expect.poll(() => service.getRun(third.run.id).status).toBe("completed");
+
+    expect(baseThreadIds).toEqual([
+      null,
+      "provisional-thread-1",
+      "provisional-thread-1",
+    ]);
+    expect(service.getAgent(agent.id).codexThreadId).toBe("provisional-thread-3");
+    expect(service.getMessages(agent.id).map((message) => message.content)).not
+      .toContain("Result 2");
+    await expect(lstat(path.join(agent.workspacePath, "discarded.ts"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fails closed if a runner returns the committed thread as provisional", async () => {
+    let call = 0;
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        if (call === 2) {
+          await writeFile(path.join(request.workspacePath, "leaked.ts"), "unsafe\n");
+        }
+        return {
+          output: `Result ${call}`,
+          threadId: request.threadId ?? "committed-thread",
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Strict thread builder" });
+    const first = await service.sendMessage(agent.id, "establish thread");
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
+
+    const second = await service.sendMessage(agent.id, "invalid continuation");
+    await expect.poll(() => service.getRun(second.run.id).status).toBe("failed");
+
+    expect(service.getRun(second.run.id).runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "run_failed",
+    });
+    expect(service.getRun(second.run.id).error).toContain(
+      "distinct provisional thread",
+    );
+    expect(service.getAgent(agent.id).codexThreadId).toBe("committed-thread");
+    await expect(lstat(path.join(agent.workspacePath, "leaked.ts"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
   it("runs the Agent in staging and promotes a safe source change", async () => {
     let runnerWorkspace = "";
     const service = await makeService({

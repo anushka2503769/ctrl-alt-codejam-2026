@@ -42,7 +42,7 @@ describe("Container Codex runner", () => {
     expect(args).not.toContain("secret-that-must-not-appear-in-argv");
   });
 
-  it("resumes a thread inside the mounted Runtime workspace", () => {
+  it("forks a committed thread inside the mounted Runtime workspace", () => {
     const config = loadConfig({
       NODE_ENV: "test",
       CODEX_HOME: "/tmp/codex-home",
@@ -57,7 +57,8 @@ describe("Container Codex runner", () => {
       },
       config,
     );
-    expect(args.slice(-3)).toEqual(["resume", "thread-123", "continue"]);
+    expect(args.slice(-3)).toEqual(["fork", "thread-123", "continue"]);
+    expect(args).not.toContain("resume");
     expect(args).not.toContain("keep-id");
   });
 });
