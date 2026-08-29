@@ -5,14 +5,17 @@ import {
   copyFile,
   lstat,
   mkdir,
+  open,
+  readFile,
   readlink,
   readdir,
   rename,
   rm,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import path from "node:path";
-import type { RunVaultFileChange } from "./types.js";
+import type { Database, RunVaultFileChange } from "./types.js";
 
 const RESERVED_DIRECTORY_NAMES = new Set([".codex", ".staging"]);
 const BINARY_EXTENSIONS = new Set([
@@ -88,9 +91,20 @@ export interface RunVaultWorkspaceInspection {
 
 export interface RunVaultPromotion {
   id: string;
+  agentId: string;
   trustedWorkspacePath: string;
   stagingWorkspacePath: string;
   backupWorkspacePath: string;
+  markerPath: string;
+}
+
+type PromotionPhase = "prepared" | "installed" | "committed";
+
+interface PromotionMarker {
+  version: 1;
+  runId: string;
+  agentId: string;
+  phase: PromotionPhase;
 }
 
 export class UnsafeWorkspaceEntryError extends Error {}
@@ -105,6 +119,29 @@ function validateWorkspaceId(id: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
     throw new Error("Invalid staging workspace ID");
   }
+}
+
+async function pathExists(candidate: string): Promise<boolean> {
+  try {
+    await lstat(candidate);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function isPromotionMarker(value: unknown): value is PromotionMarker {
+  if (!value || typeof value !== "object") return false;
+  const marker = value as Partial<PromotionMarker>;
+  return (
+    marker.version === 1 &&
+    typeof marker.runId === "string" &&
+    typeof marker.agentId === "string" &&
+    (marker.phase === "prepared" ||
+      marker.phase === "installed" ||
+      marker.phase === "committed")
+  );
 }
 
 function toRelativePath(root: string, absolutePath: string): string {
@@ -333,6 +370,11 @@ export class RunVaultWorkspaceManager {
     return path.join(this.stagingRoot, id);
   }
 
+  promotionMarkerPath(id: string): string {
+    validateWorkspaceId(id);
+    return path.join(this.stagingRoot, `${id}.promotion.json`);
+  }
+
   async snapshotWorkspace(workspacePath: string): Promise<WorkspaceSnapshot> {
     const resolvedPath = path.resolve(workspacePath);
     if (!isInside(this.workspaceRoot, resolvedPath) || resolvedPath === this.workspaceRoot) {
@@ -440,13 +482,11 @@ export class RunVaultWorkspaceManager {
   ): Promise<RunVaultPromotion> {
     const stagingWorkspacePath = this.stagingPath(id);
     const trustedPath = path.resolve(trustedWorkspacePath);
-    if (
-      !isInside(this.workspaceRoot, trustedPath) ||
-      trustedPath === this.workspaceRoot ||
-      isInside(this.stagingRoot, trustedPath)
-    ) {
+    if (path.dirname(trustedPath) !== this.workspaceRoot) {
       throw new Error("Trusted workspace path is outside the managed workspace root");
     }
+    const agentId = path.basename(trustedPath);
+    validateWorkspaceId(agentId);
     const current = await this.snapshotWorkspace(trustedPath);
     if (current.fingerprint !== expectedTrustedFingerprint) {
       throw new TrustedWorkspaceChangedError(
@@ -455,33 +495,207 @@ export class RunVaultWorkspaceManager {
     }
 
     const backupWorkspacePath = path.join(this.stagingRoot, `${id}.backup`);
-    await rename(trustedPath, backupWorkspacePath);
-    try {
-      await rename(stagingWorkspacePath, trustedPath);
-    } catch (error) {
-      await rename(backupWorkspacePath, trustedPath);
-      throw error;
-    }
-    return {
+    const markerPath = this.promotionMarkerPath(id);
+    const promotion: RunVaultPromotion = {
       id,
+      agentId,
       trustedWorkspacePath: trustedPath,
       stagingWorkspacePath,
       backupWorkspacePath,
+      markerPath,
     };
+    await this.writePromotionMarker(promotion, "prepared");
+    try {
+      await rename(trustedPath, backupWorkspacePath);
+      await rename(stagingWorkspacePath, trustedPath);
+      await this.writePromotionMarker(promotion, "installed");
+    } catch (error) {
+      await this.restorePrePromotionState(promotion);
+      await rm(markerPath, { force: true });
+      throw error;
+    }
+    return promotion;
   }
 
   async rollbackPromotion(promotion: RunVaultPromotion): Promise<void> {
-    await rename(
-      promotion.trustedWorkspacePath,
-      promotion.stagingWorkspacePath,
-    );
-    await rename(
-      promotion.backupWorkspacePath,
-      promotion.trustedWorkspacePath,
-    );
+    await this.validatePromotion(promotion);
+    await this.restorePrePromotionState(promotion);
+    await rm(promotion.markerPath, { force: true });
   }
 
   async finalizePromotion(promotion: RunVaultPromotion): Promise<void> {
+    await this.validatePromotion(promotion);
+    await this.writePromotionMarker(promotion, "committed");
     await rm(promotion.backupWorkspacePath, { recursive: true, force: true });
+    await rm(promotion.markerPath, { force: true });
+  }
+
+  async reconcileTransactions(database: Database): Promise<void> {
+    await this.initialize();
+    const entries = await readdir(this.stagingRoot, { withFileTypes: true });
+    const markerNames = entries
+      .filter(
+        (entry) =>
+          entry.isFile() && entry.name.endsWith(".promotion.json"),
+      )
+      .map((entry) => entry.name)
+      .sort();
+
+    for (const markerName of markerNames) {
+      const markerPath = path.join(this.stagingRoot, markerName);
+      const parsed = JSON.parse(await readFile(markerPath, "utf8")) as unknown;
+      if (!isPromotionMarker(parsed)) {
+        throw new Error(`Invalid RunVault promotion marker: ${markerName}`);
+      }
+      validateWorkspaceId(parsed.runId);
+      validateWorkspaceId(parsed.agentId);
+      if (markerName !== `${parsed.runId}.promotion.json`) {
+        throw new Error(`RunVault promotion marker name does not match its Run`);
+      }
+      const trustedWorkspacePath = path.join(this.workspaceRoot, parsed.agentId);
+      const promotion: RunVaultPromotion = {
+        id: parsed.runId,
+        agentId: parsed.agentId,
+        trustedWorkspacePath,
+        stagingWorkspacePath: this.stagingPath(parsed.runId),
+        backupWorkspacePath: path.join(
+          this.stagingRoot,
+          `${parsed.runId}.backup`,
+        ),
+        markerPath,
+      };
+      const run = database.runs.find(
+        (candidate) =>
+          candidate.id === parsed.runId && candidate.agentId === parsed.agentId,
+      );
+      const agent = database.agents.find(
+        (candidate) => candidate.id === parsed.agentId,
+      );
+      if (!run || !agent || path.resolve(agent.workspacePath) !== trustedWorkspacePath) {
+        throw new Error(
+          `RunVault cannot reconcile promotion ${parsed.runId}: persisted Run or Agent is missing`,
+        );
+      }
+
+      if (run.runVault?.outcome === "promoted") {
+        await this.finishCommittedPromotion(promotion);
+      } else {
+        await this.restorePrePromotionState(promotion);
+        if (run.runVault?.outcome !== "quarantined") {
+          await this.discardStagingWorkspace(parsed.runId);
+        }
+        await rm(markerPath, { force: true });
+      }
+    }
+
+    const retainedStagingIds = new Set(
+      database.runs.flatMap((run) =>
+        run.runVault?.outcome === "quarantined" &&
+        run.runVault.stagingWorkspaceId
+          ? [run.runVault.stagingWorkspaceId]
+          : [],
+      ),
+    );
+    const remaining = await readdir(this.stagingRoot, { withFileTypes: true });
+    for (const entry of remaining) {
+      if (entry.name.endsWith(".promotion.json.tmp")) {
+        await rm(path.join(this.stagingRoot, entry.name), { force: true });
+        continue;
+      }
+      if (!entry.isDirectory() || entry.name.endsWith(".backup")) continue;
+      if (!retainedStagingIds.has(entry.name)) {
+        await rm(path.join(this.stagingRoot, entry.name), {
+          recursive: true,
+          force: true,
+        });
+      }
+    }
+  }
+
+  private async validatePromotion(promotion: RunVaultPromotion): Promise<void> {
+    validateWorkspaceId(promotion.id);
+    validateWorkspaceId(promotion.agentId);
+    if (
+      path.resolve(promotion.trustedWorkspacePath) !==
+        path.join(this.workspaceRoot, promotion.agentId) ||
+      path.resolve(promotion.stagingWorkspacePath) !== this.stagingPath(promotion.id) ||
+      path.resolve(promotion.backupWorkspacePath) !==
+        path.join(this.stagingRoot, `${promotion.id}.backup`) ||
+      path.resolve(promotion.markerPath) !== this.promotionMarkerPath(promotion.id)
+    ) {
+      throw new Error("Promotion paths are outside the managed workspace root");
+    }
+  }
+
+  private async writePromotionMarker(
+    promotion: RunVaultPromotion,
+    phase: PromotionPhase,
+  ): Promise<void> {
+    await this.validatePromotion(promotion);
+    const marker: PromotionMarker = {
+      version: 1,
+      runId: promotion.id,
+      agentId: promotion.agentId,
+      phase,
+    };
+    const temporaryPath = promotion.markerPath + ".tmp";
+    await writeFile(temporaryPath, JSON.stringify(marker) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    const handle = await open(temporaryPath, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporaryPath, promotion.markerPath);
+  }
+
+  private async restorePrePromotionState(
+    promotion: RunVaultPromotion,
+  ): Promise<void> {
+    await this.validatePromotion(promotion);
+    const trustedExists = await pathExists(promotion.trustedWorkspacePath);
+    const stagingExists = await pathExists(promotion.stagingWorkspacePath);
+    const backupExists = await pathExists(promotion.backupWorkspacePath);
+
+    if (!backupExists) {
+      if (!trustedExists) {
+        throw new Error("RunVault cannot recover the missing trusted workspace");
+      }
+      return;
+    }
+    if (trustedExists && stagingExists) {
+      throw new Error("RunVault found conflicting trusted and staging workspaces");
+    }
+    if (trustedExists) {
+      await rename(promotion.trustedWorkspacePath, promotion.stagingWorkspacePath);
+    }
+    await rename(promotion.backupWorkspacePath, promotion.trustedWorkspacePath);
+  }
+
+  private async finishCommittedPromotion(
+    promotion: RunVaultPromotion,
+  ): Promise<void> {
+    await this.validatePromotion(promotion);
+    const trustedExists = await pathExists(promotion.trustedWorkspacePath);
+    const stagingExists = await pathExists(promotion.stagingWorkspacePath);
+    const backupExists = await pathExists(promotion.backupWorkspacePath);
+
+    if (trustedExists && stagingExists) {
+      if (backupExists) {
+        throw new Error("RunVault found conflicting committed workspaces");
+      }
+      await rename(promotion.trustedWorkspacePath, promotion.backupWorkspacePath);
+      await rename(promotion.stagingWorkspacePath, promotion.trustedWorkspacePath);
+    } else if (!trustedExists && stagingExists) {
+      await rename(promotion.stagingWorkspacePath, promotion.trustedWorkspacePath);
+    } else if (!trustedExists) {
+      throw new Error("RunVault cannot recover the committed workspace");
+    }
+
+    await rm(promotion.backupWorkspacePath, { recursive: true, force: true });
+    await rm(promotion.markerPath, { force: true });
   }
 }

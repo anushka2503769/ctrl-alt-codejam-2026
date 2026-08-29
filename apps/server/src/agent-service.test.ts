@@ -14,6 +14,7 @@ import { loadConfig } from "./config.js";
 import { RunCancelledError, RunTimedOutError } from "./errors.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
+import { RunVaultWorkspaceManager } from "./runvault-workspace.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -43,7 +44,7 @@ afterEach(async () => {
   );
 });
 
-async function makeService(runner: AgentRunner = new FakeRunner()): Promise<AgentService> {
+async function makeServiceHarness(runner: AgentRunner = new FakeRunner()) {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -54,14 +55,24 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
   });
+  const store = new JsonStore(path.join(root, "data", "db.json"));
+  const workspaces = new WorkspaceManager(path.join(root, "workspaces"));
+  const runVaultWorkspaces = new RunVaultWorkspaceManager(
+    path.join(root, "workspaces"),
+  );
   const service = new AgentService(
     config,
-    new JsonStore(path.join(root, "data", "db.json")),
-    new WorkspaceManager(path.join(root, "workspaces")),
+    store,
+    workspaces,
     runner,
+    runVaultWorkspaces,
   );
   await service.initialize();
-  return service;
+  return { config, root, runVaultWorkspaces, service, store };
+}
+
+async function makeService(runner: AgentRunner = new FakeRunner()): Promise<AgentService> {
+  return (await makeServiceHarness(runner)).service;
 }
 
 describe("Agent lifecycle", () => {
@@ -542,6 +553,61 @@ describe("Agent lifecycle", () => {
     });
     await expect(lstat(path.join(agent.workspacePath, "partial.txt"))).rejects
       .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("discards interrupted staging and records recovery after restart", async () => {
+    const harness = await makeServiceHarness();
+    const agent = await harness.service.createAgent({ name: "Restarted builder" });
+    await writeFile(path.join(agent.workspacePath, "trusted.txt"), "trusted\n");
+    const staging = await harness.runVaultWorkspaces.createStagingWorkspace(
+      "run-restart",
+      agent.workspacePath,
+    );
+    await writeFile(path.join(staging.path, "partial.txt"), "partial\n");
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    await harness.store.mutate((database) => {
+      const storedAgent = database.agents.find((candidate) => candidate.id === agent.id);
+      if (!storedAgent) throw new Error("fixture Agent missing");
+      storedAgent.status = "busy";
+      database.runs.push({
+        id: staging.id,
+        agentId: agent.id,
+        status: "running",
+        prompt: "interrupted work",
+        output: null,
+        error: null,
+        usage: null,
+        runVault: null,
+        startedAt: timestamp,
+        completedAt: null,
+        createdAt: timestamp,
+      });
+    });
+
+    const restarted = new AgentService(
+      harness.config,
+      new JsonStore(path.join(harness.root, "data", "db.json")),
+      new WorkspaceManager(path.join(harness.root, "workspaces")),
+      new FakeRunner(),
+      new RunVaultWorkspaceManager(path.join(harness.root, "workspaces")),
+    );
+    await restarted.initialize();
+
+    expect(restarted.getRun(staging.id)).toMatchObject({
+      status: "cancelled",
+      error: "Server restarted while this run was active",
+      runVault: {
+        outcome: "discarded",
+        reason: "cancelled",
+        resolution: "policy",
+        stagingWorkspaceId: staging.id,
+        verification: { status: "skipped" },
+      },
+    });
+    expect(restarted.getAgent(agent.id).status).toBe("ready");
+    expect(await readFile(path.join(agent.workspacePath, "trusted.txt"), "utf8"))
+      .toBe("trusted\n");
+    await expect(lstat(staging.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("quarantines when trusted files change while a Run is active", async () => {
