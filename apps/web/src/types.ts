@@ -17,6 +17,19 @@ export type RunVaultResolution =
   | "policy"
   | "human_approved"
   | "human_discarded";
+export type RunVaultVerificationStatus = "passed" | "failed" | "skipped";
+export type RunVaultFindingCode =
+  | "execution_cancelled"
+  | "execution_timed_out"
+  | "execution_failed"
+  | "verification_failed"
+  | "trusted_workspace_changed"
+  | "unsafe_link"
+  | "protected_path"
+  | "dependency_change"
+  | "unsafe_file"
+  | "change_limit_exceeded"
+  | "deletion_limit_exceeded";
 export type RunVaultChangeKind = "added" | "modified" | "deleted";
 
 export interface RunVaultFileChange {
@@ -30,7 +43,7 @@ export interface RunVaultFileChange {
 }
 
 export interface RunVaultFinding {
-  code: string;
+  code: RunVaultFindingCode;
   severity: "info" | "warning" | "blocking";
   title: string;
   explanation: string;
@@ -77,13 +90,15 @@ export interface RunVaultDecision {
     omittedFileCount: number;
   };
   findings: RunVaultFinding[];
-  verification: {
-    status: "passed" | "failed" | "skipped";
-    command: string | null;
-    redactedSummary: string | null;
-  };
+  verification: RunVaultVerification;
   trustedWorkspaceChanged: boolean;
   decidedAt: string;
+}
+
+export interface RunVaultVerification {
+  status: RunVaultVerificationStatus;
+  command: string | null;
+  redactedSummary: string | null;
 }
 
 export interface AgentRun {

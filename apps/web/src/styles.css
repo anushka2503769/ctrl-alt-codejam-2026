@@ -999,9 +999,55 @@ textarea:focus {
   text-align: right;
 }
 
+.runvault-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.runvault-status-grid > section {
+  min-width: 0;
+  border: 1px solid #e1dfd7;
+  border-radius: 10px;
+  padding: 10px 11px;
+  background: white;
+}
+
+.runvault-status-label {
+  display: block;
+  margin-bottom: 5px;
+  color: #8a8b83;
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.runvault-status-grid strong {
+  display: block;
+  color: #494a44;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.runvault-status-grid p {
+  margin: 5px 0 0;
+  color: #85867f;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.runvault-status-grid code {
+  display: inline-block;
+  margin-top: 6px;
+  color: #66675f;
+  font-size: 8px;
+}
+
 .runvault-evidence {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1px;
   margin: 10px 0 0;
   overflow: hidden;
@@ -1054,6 +1100,10 @@ textarea:focus {
 .runvault-evidence .evidence-skipped {
   color: #806429;
 }
+
+.runvault-status-grid .evidence-passed { color: #267758; }
+.runvault-status-grid .evidence-failed { color: #a04d48; }
+.runvault-status-grid .evidence-skipped { color: #806429; }
 
 .protected-paths {
   margin-top: 9px;
@@ -1448,6 +1498,10 @@ textarea:focus {
   }
 
   .runvault-evidence {
+    grid-template-columns: 1fr;
+  }
+
+  .runvault-status-grid {
     grid-template-columns: 1fr;
   }
 

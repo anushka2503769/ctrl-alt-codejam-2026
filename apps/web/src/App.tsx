@@ -7,6 +7,7 @@ import {
   resolvedRunId,
   runsWithoutMessages as findRunsWithoutMessages,
 } from "./run-history";
+import { workspaceOutcomeCopy } from "./runvault-copy";
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
 
 const starterPrompts = [
@@ -51,7 +52,10 @@ function RunSummary({
   selected: boolean;
   onSelect: () => void;
 }) {
-  const label = run.runVault?.outcome ?? run.status;
+  const statusClass = run.runVault?.outcome ?? run.status;
+  const label = run.runVault
+    ? workspaceOutcomeCopy[run.runVault.outcome].shortLabel
+    : run.status;
   return (
     <button
       type="button"
@@ -63,7 +67,14 @@ function RunSummary({
         <strong>Run {run.id.slice(0, 8)}</strong>
         <small>{formatTime(run.completedAt ?? run.createdAt)}</small>
       </span>
-      <span className={`run-summary-status run-summary-${label}`}>{label}</span>
+      <span
+        className={`run-summary-status run-summary-${statusClass}`}
+        aria-label={run.runVault
+          ? `Workspace outcome: ${workspaceOutcomeCopy[run.runVault.outcome].label}`
+          : `Run status: ${run.status}`}
+      >
+        {label}
+      </span>
     </button>
   );
 }

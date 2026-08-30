@@ -1,8 +1,9 @@
 # RunVault
 
 Transactional workspace middleware for AI coding agents, built on the Volc
-Agent Launchpad baseline. Every Agent Run is staged, inspected, and verified
-before its workspace and Codex thread can become trusted state.
+Agent Launchpad baseline. Every Agent Run is staged and inspected before its
+workspace and Codex thread can become trusted state. When a test script is
+configured and safe to execute, its result is reported separately.
 
 Run it locally with Docker, Colima, or rootless Podman, or deploy it to
 Volcengine ECS.
@@ -27,7 +28,7 @@ Volcengine ECS.
 
 - Transactional staging for every Agent Run
 - Deterministic promote, quarantine, and discard policy
-- Verification inside staged workspaces before promotion
+- Explicit verification status, with `npm test` run when configured
 - Redacted Run evidence with protected-path metadata
 - Human approval or discard for quarantined work
 - Crash-safe promotion and restart reconciliation
@@ -107,9 +108,10 @@ In the Web UI:
 The Agent can write files and run commands. Later messages fork from the last
 promoted Codex session, keeping discarded or quarantined context provisional.
 
-After each completed Run, inspect the **RunVault decision** panel. Safe,
-verified work is promoted automatically. Risky changes remain isolated and
-offer **Approve and promote** and **Discard staged work** controls.
+After each completed Run, inspect the **RunVault decision** panel. Workspace
+outcome and verification status are shown separately. Policy-compliant work is
+promoted automatically; risky changes remain isolated and offer **Approve and
+promote** and **Discard staged work** controls.
 
 To exercise quarantine deliberately, try:
 
@@ -254,7 +256,8 @@ and startup reconciliation repairs interrupted transactions.
 
 RunVault's deliberate guarantee is:
 
-> An Agent cannot silently turn unverified work into persistent workspace state.
+> An Agent cannot write directly to the trusted workspace; only RunVault's
+> inspected promotion path can change it.
 
 Deleting an Agent archives its workspace under `workspaces/.deleted/`.
 
