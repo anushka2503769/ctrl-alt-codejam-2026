@@ -39,6 +39,23 @@ export interface RunVaultChangeSummary {
   modifiedCount: number;
   deletedCount: number;
   protectedPathsTouched: string[];
+  files: RunVaultFileChange[];
+  omittedFileCount: number;
+}
+
+export type RunVaultFindingCode =
+  | "execution_cancelled" | "execution_timed_out" | "execution_failed"
+  | "verification_failed" | "trusted_workspace_changed" | "unsafe_link"
+  | "protected_path" | "dependency_change" | "unsafe_file"
+  | "change_limit_exceeded" | "deletion_limit_exceeded";
+
+export interface RunVaultFinding {
+  code: RunVaultFindingCode;
+  severity: "info" | "warning" | "blocking";
+  title: string;
+  explanation: string;
+  paths: string[];
+  omittedPathCount: number;
 }
 
 export interface RunVaultVerification {
@@ -56,6 +73,7 @@ export interface RunVaultDecision {
   trustedWorkspaceFingerprint: string | null;
   stagingWorkspaceFingerprint: string | null;
   changedFiles: RunVaultChangeSummary;
+  findings: RunVaultFinding[];
   verification: RunVaultVerification;
   trustedWorkspaceChanged: boolean;
   decidedAt: string;

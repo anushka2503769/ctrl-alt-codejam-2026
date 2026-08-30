@@ -29,6 +29,17 @@ export class JsonStore {
           run.runVault.resolution ??= "policy";
           run.runVault.trustedWorkspaceFingerprint ??= null;
           run.runVault.stagingWorkspaceFingerprint ??= null;
+          run.runVault.findings ??= [];
+          run.runVault.changedFiles ??= {
+            addedCount: 0,
+            modifiedCount: 0,
+            deletedCount: 0,
+            protectedPathsTouched: [],
+            files: [],
+            omittedFileCount: 0,
+          };
+          run.runVault.changedFiles.files ??= [];
+          run.runVault.changedFiles.omittedFileCount ??= 0;
         }
       }
       this.data = parsed;

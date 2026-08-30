@@ -103,6 +103,8 @@ describe("JsonStore", () => {
       resolution: "policy",
       trustedWorkspaceFingerprint: null,
       stagingWorkspaceFingerprint: null,
+      findings: [],
+      changedFiles: { files: [], omittedFileCount: 0 },
     });
   });
 

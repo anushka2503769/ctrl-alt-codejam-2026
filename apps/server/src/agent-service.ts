@@ -89,12 +89,15 @@ export class AgentService {
               run.runVault?.trustedWorkspaceFingerprint ?? null,
             stagingWorkspaceFingerprint:
               run.runVault?.stagingWorkspaceFingerprint ?? null,
-            changedFiles: run.runVault?.changedFiles ?? {
-              addedCount: 0,
-              modifiedCount: 0,
-              deletedCount: 0,
-              protectedPathsTouched: [],
-            },
+        changedFiles: run.runVault?.changedFiles ?? {
+          addedCount: 0,
+          modifiedCount: 0,
+          deletedCount: 0,
+          protectedPathsTouched: [],
+          files: [],
+          omittedFileCount: 0,
+        },
+        findings: run.runVault?.findings ?? [],
             verification: skippedVerification(
               "Verification was interrupted when the server restarted.",
             ),
@@ -535,6 +538,7 @@ export class AgentService {
         trustedWorkspaceFingerprint: staging.trustedSnapshot.fingerprint,
         stagingWorkspaceFingerprint: inspection.stagingFingerprint,
         changedFiles: policy.changedFiles,
+        findings: policy.findings,
         verification,
         trustedWorkspaceChanged:
           currentTrusted.fingerprint !== staging.trustedSnapshot.fingerprint,
@@ -565,6 +569,7 @@ export class AgentService {
             outcome: policy.outcome,
             reason: policy.reason,
             changedFiles: policy.changedFiles,
+            findings: policy.findings,
             trustedWorkspaceChanged: true,
             decidedAt: now(),
           };
@@ -664,6 +669,7 @@ export class AgentService {
           staging?.trustedSnapshot.fingerprint ?? null,
         stagingWorkspaceFingerprint,
         changedFiles: policy.changedFiles,
+        findings: policy.findings,
         verification,
         trustedWorkspaceChanged,
         decidedAt: completedAt,

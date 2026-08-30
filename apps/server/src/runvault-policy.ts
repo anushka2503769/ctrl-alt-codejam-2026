@@ -3,11 +3,15 @@ import type {
   RunVaultFileChange,
   RunVaultOutcome,
   RunVaultReason,
+  RunVaultFinding,
   RunVaultVerificationStatus,
 } from "./types.js";
 
 export const DEFAULT_MAX_CHANGED_FILES = 20;
 export const DEFAULT_MAX_DELETED_FILES = 5;
+export const MAX_EVIDENCE_FILES = 100;
+export const MAX_FINDINGS = 50;
+export const MAX_FINDING_PATHS = 50;
 
 export type RunVaultExecutionStatus =
   | "succeeded"
@@ -28,6 +32,7 @@ export interface RunVaultPolicyResult {
   outcome: RunVaultOutcome;
   reason: RunVaultReason;
   changedFiles: RunVaultChangeSummary;
+  findings: RunVaultFinding[];
 }
 
 function summarizeChanges(changes: RunVaultFileChange[]): RunVaultChangeSummary {
@@ -36,20 +41,47 @@ function summarizeChanges(changes: RunVaultFileChange[]): RunVaultChangeSummary 
     .map((change) => change.path)
     .sort();
 
+  const ordered = [...changes].sort((a, b) => a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind));
   return {
     addedCount: changes.filter((change) => change.kind === "added").length,
     modifiedCount: changes.filter((change) => change.kind === "modified").length,
     deletedCount: changes.filter((change) => change.kind === "deleted").length,
     protectedPathsTouched,
+    files: ordered.slice(0, MAX_EVIDENCE_FILES),
+    omittedFileCount: Math.max(0, ordered.length - MAX_EVIDENCE_FILES),
   };
+}
+
+function finding(code: RunVaultFinding["code"], title: string, explanation: string, paths: string[] = []): RunVaultFinding {
+  const ordered = [...new Set(paths)].sort();
+  return { code, severity: code === "trusted_workspace_changed" || code === "verification_failed" || code.startsWith("execution_") ? "blocking" : "warning", title, explanation, paths: ordered.slice(0, MAX_FINDING_PATHS), omittedPathCount: Math.max(0, ordered.length - MAX_FINDING_PATHS) };
+}
+
+function collectFindings(input: RunVaultPolicyInput, summary: RunVaultChangeSummary): RunVaultFinding[] {
+  const findings: RunVaultFinding[] = [];
+  if (input.executionStatus === "cancelled") findings.push(finding("execution_cancelled", "Execution cancelled", "The Agent execution was cancelled."));
+  if (input.executionStatus === "timed_out") findings.push(finding("execution_timed_out", "Execution timed out", "The Agent execution exceeded its time limit."));
+  if (input.executionStatus === "failed") findings.push(finding("execution_failed", "Execution failed", "The Agent execution failed."));
+  if (input.verificationStatus === "failed") findings.push(finding("verification_failed", "Verification failed", "Configured verification did not pass."));
+  if (input.trustedWorkspaceChanged) findings.push(finding("trusted_workspace_changed", "Trusted workspace changed", "The trusted workspace changed during this Run."));
+  const paths = (predicate: (change: RunVaultFileChange) => boolean) => input.changes.filter(predicate).map(change => change.path);
+  if (input.changes.some(change => change.symbolicLink)) findings.push(finding("unsafe_link", "Unsafe symbolic link", "A changed symbolic link requires review.", paths(change => change.symbolicLink)));
+  if (input.changes.some(change => change.protected)) findings.push(finding("protected_path", "Protected path changed", "A protected path was changed.", paths(change => change.protected)));
+  if (input.changes.some(change => change.dependencyFile)) findings.push(finding("dependency_change", "Dependency file changed", "A dependency manifest or lockfile was changed.", paths(change => change.dependencyFile)));
+  if (input.changes.some(change => change.executable || change.binary)) findings.push(finding("unsafe_file", "Unsafe file changed", "A changed file is executable or binary.", paths(change => change.executable || change.binary)));
+  const maxChangedFiles = input.maxChangedFiles ?? DEFAULT_MAX_CHANGED_FILES;
+  const maxDeletedFiles = input.maxDeletedFiles ?? DEFAULT_MAX_DELETED_FILES;
+  if (input.changes.length > maxChangedFiles) findings.push(finding("change_limit_exceeded", "Change limit exceeded", `The Run changed more than ${maxChangedFiles} files.`));
+  if (summary.deletedCount > maxDeletedFiles) findings.push(finding("deletion_limit_exceeded", "Deletion limit exceeded", `The Run deleted more than ${maxDeletedFiles} files.`));
+  return findings.slice(0, MAX_FINDINGS);
 }
 
 function result(
   outcome: RunVaultOutcome,
   reason: RunVaultReason,
-  changedFiles: RunVaultChangeSummary,
+  changedFiles: RunVaultChangeSummary, findings: RunVaultFinding[],
 ): RunVaultPolicyResult {
-  return { outcome, reason, changedFiles };
+  return { outcome, reason, changedFiles, findings };
 }
 
 /**
@@ -61,33 +93,34 @@ export function evaluateRunVaultPolicy(
   input: RunVaultPolicyInput,
 ): RunVaultPolicyResult {
   const summary = summarizeChanges(input.changes);
+  const findings = collectFindings(input, summary);
 
   if (input.executionStatus === "cancelled") {
-    return result("discarded", "cancelled", summary);
+    return result("discarded", "cancelled", summary, findings);
   }
   if (input.executionStatus === "timed_out") {
-    return result("discarded", "timed_out", summary);
+    return result("discarded", "timed_out", summary, findings);
   }
   if (input.executionStatus === "failed") {
-    return result("discarded", "run_failed", summary);
+    return result("discarded", "run_failed", summary, findings);
   }
   if (input.verificationStatus === "failed") {
-    return result("discarded", "verification_failed", summary);
+    return result("discarded", "verification_failed", summary, findings);
   }
   if (input.trustedWorkspaceChanged) {
-    return result("quarantined", "trusted_workspace_changed", summary);
+    return result("quarantined", "trusted_workspace_changed", summary, findings);
   }
   if (input.changes.some((change) => change.symbolicLink)) {
-    return result("quarantined", "unsafe_link", summary);
+    return result("quarantined", "unsafe_link", summary, findings);
   }
   if (input.changes.some((change) => change.protected)) {
-    return result("quarantined", "protected_path", summary);
+    return result("quarantined", "protected_path", summary, findings);
   }
   if (input.changes.some((change) => change.dependencyFile)) {
-    return result("quarantined", "dependency_change", summary);
+    return result("quarantined", "dependency_change", summary, findings);
   }
   if (input.changes.some((change) => change.executable || change.binary)) {
-    return result("quarantined", "unsafe_file", summary);
+    return result("quarantined", "unsafe_file", summary, findings);
   }
 
   const maxChangedFiles = input.maxChangedFiles ?? DEFAULT_MAX_CHANGED_FILES;
@@ -96,8 +129,8 @@ export function evaluateRunVaultPolicy(
     input.changes.length > maxChangedFiles ||
     summary.deletedCount > maxDeletedFiles
   ) {
-    return result("quarantined", "change_limit_exceeded", summary);
+    return result("quarantined", "change_limit_exceeded", summary, findings);
   }
 
-  return result("promoted", "verified_safe", summary);
+  return result("promoted", "verified_safe", summary, findings);
 }

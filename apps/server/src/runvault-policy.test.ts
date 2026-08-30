@@ -42,7 +42,10 @@ describe("RunVault deterministic policy", () => {
         modifiedCount: 1,
         deletedCount: 0,
         protectedPathsTouched: [],
+        files: [change("src/index.ts")],
+        omittedFileCount: 0,
       },
+      findings: [],
     });
   });
 
@@ -112,8 +115,48 @@ describe("RunVault deterministic policy", () => {
         modifiedCount: 1,
         deletedCount: 1,
         protectedPathsTouched: [".env.production", "deploy/app.yaml"],
+        files: [
+          change(".env.production", { protected: true }),
+          change("deploy/app.yaml", { protected: true, kind: "deleted" }),
+          change("src/index.ts", { kind: "added" }),
+        ],
+        omittedFileCount: 0,
       },
+      findings: [{
+        code: "protected_path",
+        severity: "warning",
+        title: "Protected path changed",
+        explanation: "A protected path was changed.",
+        paths: [".env.production", "deploy/app.yaml"],
+        omittedPathCount: 0,
+      }],
     });
+  });
+
+  it("reports all applicable findings while preserving primary precedence", () => {
+    const result = evaluate({
+      verificationStatus: "failed",
+      trustedWorkspaceChanged: true,
+      changes: [
+        change(".env", { protected: true, dependencyFile: true, binary: true, symbolicLink: true }),
+      ],
+    });
+    expect(result.reason).toBe("verification_failed");
+    expect(result.findings.map((item) => item.code)).toEqual([
+      "verification_failed", "trusted_workspace_changed", "unsafe_link",
+      "protected_path", "dependency_change", "unsafe_file",
+    ]);
+  });
+
+  it("bounds file manifests and finding paths", () => {
+    const changes = Array.from({ length: 105 }, (_, index) =>
+      change(`src/${index}.ts`, { protected: true }),
+    );
+    const result = evaluate({ changes });
+    expect(result.changedFiles.files).toHaveLength(100);
+    expect(result.changedFiles.omittedFileCount).toBe(5);
+    expect(result.findings[0]?.paths).toHaveLength(50);
+    expect(result.findings[0]?.omittedPathCount).toBe(55);
   });
 
   it("quarantines dependency files", () => {
