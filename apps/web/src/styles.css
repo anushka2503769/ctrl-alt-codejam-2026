@@ -824,6 +824,64 @@ textarea:focus {
   font-size: 11px;
 }
 
+.run-summary {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px 0 2px;
+  border: 1px solid #dedbd2;
+  border-radius: 10px;
+  padding: 9px 11px;
+  color: #55564f;
+  background: rgba(255, 255, 255, 0.72);
+  cursor: pointer;
+  text-align: left;
+}
+
+.run-summary:hover,
+.run-summary.selected {
+  border-color: #a99be9;
+  background: white;
+}
+
+.run-summary > span:first-child {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.run-summary strong {
+  font-size: 10px;
+}
+
+.run-summary small {
+  color: #96968f;
+  font-size: 8px;
+}
+
+.run-summary-status {
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: #686960;
+  background: #efede7;
+  font-size: 8px;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.run-summary-promoted { color: #267758; background: #ddf1e9; }
+.run-summary-quarantined { color: #8a5c10; background: #f8e9c8; }
+.run-summary-discarded,
+.run-summary-failed,
+.run-summary-cancelled { color: #98504d; background: #f5e3e1; }
+
+.orphan-run {
+  margin-bottom: 24px;
+}
+
 .runvault-panel {
   --runvault-accent: #6d5bd0;
   margin: 18px 0 2px;

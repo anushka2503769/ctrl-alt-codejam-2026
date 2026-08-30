@@ -17,6 +17,26 @@ export type RunVaultResolution =
   | "policy"
   | "human_approved"
   | "human_discarded";
+export type RunVaultChangeKind = "added" | "modified" | "deleted";
+
+export interface RunVaultFileChange {
+  path: string;
+  kind: RunVaultChangeKind;
+  protected: boolean;
+  dependencyFile: boolean;
+  executable: boolean;
+  binary: boolean;
+  symbolicLink: boolean;
+}
+
+export interface RunVaultFinding {
+  code: string;
+  severity: "info" | "warning" | "blocking";
+  title: string;
+  explanation: string;
+  paths: string[];
+  omittedPathCount: number;
+}
 
 export interface Agent {
   id: string;
@@ -53,7 +73,10 @@ export interface RunVaultDecision {
     modifiedCount: number;
     deletedCount: number;
     protectedPathsTouched: string[];
+    files: RunVaultFileChange[];
+    omittedFileCount: number;
   };
+  findings: RunVaultFinding[];
   verification: {
     status: "passed" | "failed" | "skipped";
     command: string | null;

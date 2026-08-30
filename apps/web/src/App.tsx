@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
 import { RunVaultPanel, type RunVaultAction } from "./RunVaultPanel";
+import {
+  lastMessageIndexes,
+  replaceRun,
+  resolvedRunId,
+  runsWithoutMessages as findRunsWithoutMessages,
+} from "./run-history";
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
 
 const starterPrompts = [
@@ -36,6 +42,32 @@ function Spinner() {
   return <span className="spinner" aria-label="Loading" />;
 }
 
+function RunSummary({
+  run,
+  selected,
+  onSelect,
+}: {
+  run: AgentRun;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const label = run.runVault?.outcome ?? run.status;
+  return (
+    <button
+      type="button"
+      className={`run-summary${selected ? " selected" : ""}`}
+      aria-expanded={selected}
+      onClick={onSelect}
+    >
+      <span>
+        <strong>Run {run.id.slice(0, 8)}</strong>
+        <small>{formatTime(run.completedAt ?? run.createdAt)}</small>
+      </span>
+      <span className={`run-summary-status run-summary-${label}`}>{label}</span>
+    </button>
+  );
+}
+
 export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -45,8 +77,12 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
-  const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
-  const [runVaultAction, setRunVaultAction] = useState<RunVaultAction | null>(null);
+  const [runs, setRuns] = useState<AgentRun[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [runVaultAction, setRunVaultAction] = useState<{
+    runId: string;
+    action: RunVaultAction;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
@@ -61,6 +97,22 @@ export default function App() {
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
     [agents, selectedId],
+  );
+  const selectedRun = useMemo(
+    () => runs.find((run) => run.id === selectedRunId) ?? null,
+    [runs, selectedRunId],
+  );
+  const activeRun = useMemo(
+    () => runs.find((run) => ["queued", "running"].includes(run.status)) ?? null,
+    [runs],
+  );
+  const lastMessageIndexByRunId = useMemo(
+    () => lastMessageIndexes(messages),
+    [messages],
+  );
+  const runsWithoutMessages = useMemo(
+    () => findRunsWithoutMessages(runs, messages),
+    [messages, runs],
   );
 
   const refreshAgents = useCallback(async () => {
@@ -78,6 +130,15 @@ export default function App() {
     if (mountedRef.current && selectedIdRef.current === agentId) {
       setMessages(result.messages);
     }
+  }, []);
+
+  const refreshRuns = useCallback(async (agentId: string) => {
+    const result = await api.runs(agentId);
+    if (mountedRef.current && selectedIdRef.current === agentId) {
+      setRuns(result.runs);
+      setSelectedRunId((current) => resolvedRunId(current, result.runs));
+    }
+    return result.runs;
   }, []);
 
   const bootstrap = useCallback(async () => {
@@ -100,20 +161,21 @@ export default function App() {
   }, [bootstrap]);
 
   useEffect(() => {
-    setActiveRun(null);
+    setRuns([]);
+    setSelectedRunId(null);
     setRunVaultAction(null);
     setShowSettings(false);
     if (!selectedId) {
       setMessages([]);
       return;
     }
-    void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
-      .then(([, result]) => {
+    void Promise.all([refreshMessages(selectedId), refreshRuns(selectedId)])
+      .then(([, nextRuns]) => {
         if (selectedIdRef.current !== selectedId) return;
-        const latest = result.runs[0] ?? null;
-        setActiveRun(latest);
-        if (latest && ["queued", "running"].includes(latest.status)) {
-          void pollRun(latest.id, selectedId).catch((reason) =>
+        for (const run of nextRuns.filter((item) =>
+          ["queued", "running"].includes(item.status),
+        )) {
+          void pollRun(run.id, selectedId).catch((reason) =>
             setError(reason instanceof Error ? reason.message : String(reason)),
           );
         }
@@ -121,7 +183,7 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshMessages, selectedId]);
+  }, [refreshMessages, refreshRuns, selectedId]);
 
   useEffect(() => {
     if (selected) {
@@ -139,8 +201,8 @@ export default function App() {
     if (!container) return;
     if (
       runVaultPanel &&
-      activeRun?.runVault &&
-      !["queued", "running"].includes(activeRun.status)
+      selectedRun?.runVault &&
+      !["queued", "running"].includes(selectedRun.status)
     ) {
       const containerTop = container.getBoundingClientRect().top;
       const panelTop = runVaultPanel.getBoundingClientRect().top;
@@ -151,7 +213,7 @@ export default function App() {
       return;
     }
     container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
-  }, [messages, activeRun]);
+  }, [messages, selectedRun]);
 
   const createAgent = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -229,9 +291,15 @@ export default function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 900));
         if (!mountedRef.current) return;
         const result = await api.run(runId);
-        if (selectedIdRef.current === agentId) setActiveRun(result.run);
+        if (selectedIdRef.current === agentId) {
+          setRuns((current) => replaceRun(current, result.run));
+        }
         if (!["queued", "running"].includes(result.run.status)) {
-          await Promise.all([refreshMessages(agentId), refreshAgents()]);
+          await Promise.all([
+            refreshMessages(agentId),
+            refreshRuns(agentId),
+            refreshAgents(),
+          ]);
           return;
         }
       }
@@ -250,7 +318,8 @@ export default function App() {
       const result = await api.sendMessage(selected.id, content);
       if (selectedIdRef.current === selected.id) {
         setMessages((current) => [...current, result.message]);
-        setActiveRun(result.run);
+        setRuns((current) => replaceRun(current, result.run));
+        setSelectedRunId(result.run.id);
       }
       setAgents((current) =>
         current.map((agent) =>
@@ -260,13 +329,12 @@ export default function App() {
       await pollRun(result.run.id, selected.id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
-      setActiveRun(null);
       await refreshAgents();
     }
   };
 
   const resolveRunVault = async (action: RunVaultAction) => {
-    if (!activeRun?.runVault || activeRun.runVault.outcome !== "quarantined") {
+    if (!selectedRun?.runVault || selectedRun.runVault.outcome !== "quarantined") {
       return;
     }
     if (
@@ -277,16 +345,16 @@ export default function App() {
     ) {
       return;
     }
-    const agentId = activeRun.agentId;
-    setRunVaultAction(action);
+    const agentId = selectedRun.agentId;
+    setRunVaultAction({ runId: selectedRun.id, action });
     setError(null);
     try {
       const result =
         action === "approve"
-          ? await api.approveRun(activeRun.id)
-          : await api.discardRun(activeRun.id);
+          ? await api.approveRun(selectedRun.id)
+          : await api.discardRun(selectedRun.id);
       if (selectedIdRef.current === agentId) {
-        setActiveRun(result.run);
+        setRuns((current) => replaceRun(current, result.run));
       }
       await Promise.all([refreshMessages(agentId), refreshAgents()]);
     } catch (reason) {
@@ -541,7 +609,7 @@ export default function App() {
               </div>
 
               <div className="messages" ref={messagesContainer}>
-                {messages.length === 0 && !activeRun ? (
+                {messages.length === 0 && runs.length === 0 ? (
                   <div className="welcome">
                     <div className="welcome-orbit">
                       <div>⌁</div>
@@ -561,16 +629,102 @@ export default function App() {
                     </div>
                   </div>
                 ) : (
-                  messages.map((message) => (
-                    <article className={"message message-" + message.role} key={message.id}>
-                      <div className="message-meta">
-                        <strong>{message.role === "user" ? "You" : selected.name}</strong>
-                        <span>{formatTime(message.createdAt)}</span>
+                  messages.map((message, index) => {
+                    const run = runs.find((item) => item.id === message.runId);
+                    const isLastMessageForRun =
+                      lastMessageIndexByRunId.get(message.runId) === index;
+                    return (
+                      <div key={message.id}>
+                        <article className={"message message-" + message.role}>
+                          <div className="message-meta">
+                            <strong>{message.role === "user" ? "You" : selected.name}</strong>
+                            <span>{formatTime(message.createdAt)}</span>
+                          </div>
+                          <div className="message-body">{message.content}</div>
+                        </article>
+                        {run && isLastMessageForRun &&
+                          !["queued", "running"].includes(run.status) && (
+                          <div
+                            ref={selectedRunId === run.id
+                              ? runVaultPanelAnchor
+                              : undefined}
+                          >
+                            <RunSummary
+                              run={run}
+                              selected={selectedRunId === run.id}
+                              onSelect={() => setSelectedRunId((current) =>
+                                current === run.id ? null : run.id,
+                              )}
+                            />
+                            {selectedRunId === run.id && run.runVault && (
+                              <RunVaultPanel
+                                run={run}
+                                action={runVaultAction?.runId === run.id
+                                  ? runVaultAction.action
+                                  : null}
+                                onAction={(action) => void resolveRunVault(action)}
+                              />
+                            )}
+                            {selectedRunId === run.id &&
+                              run.status === "failed" && !run.runVault && (
+                              <article className="run-error">
+                                <strong>Run failed</strong>
+                                <span>{run.error}</span>
+                              </article>
+                            )}
+                          </div>
+                        )}
                       </div>
-                      <div className="message-body">{message.content}</div>
-                    </article>
-                  ))
+                    );
+                  })
                 )}
+                {runsWithoutMessages.map((run) => (
+                  <div
+                    className="orphan-run"
+                    key={run.id}
+                    ref={selectedRunId === run.id ? runVaultPanelAnchor : undefined}
+                  >
+                    <article className="message message-user">
+                      <div className="message-meta">
+                        <strong>You</strong>
+                        <span>{formatTime(run.createdAt)}</span>
+                      </div>
+                      <div className="message-body">{run.prompt}</div>
+                    </article>
+                    {run.output && (
+                      <article className="message message-assistant">
+                        <div className="message-meta">
+                          <strong>{selected.name}</strong>
+                        </div>
+                        <div className="message-body">{run.output}</div>
+                      </article>
+                    )}
+                    {!["queued", "running"].includes(run.status) && (
+                      <RunSummary
+                        run={run}
+                        selected={selectedRunId === run.id}
+                        onSelect={() => setSelectedRunId((current) =>
+                          current === run.id ? null : run.id,
+                        )}
+                      />
+                    )}
+                    {selectedRunId === run.id && run.runVault && (
+                      <RunVaultPanel
+                        run={run}
+                        action={runVaultAction?.runId === run.id
+                          ? runVaultAction.action
+                          : null}
+                        onAction={(action) => void resolveRunVault(action)}
+                      />
+                    )}
+                    {selectedRunId === run.id && run.error && (
+                      <article className="run-error">
+                        <strong>Run failed</strong>
+                        <span>{run.error}</span>
+                      </article>
+                    )}
+                  </div>
+                ))}
                 {activeRun && ["queued", "running"].includes(activeRun.status) && (
                   <article className="message message-assistant thinking">
                     <div className="message-meta">
@@ -583,22 +737,6 @@ export default function App() {
                     </div>
                   </article>
                 )}
-                {activeRun?.status === "failed" && (
-                  <article className="run-error">
-                    <strong>Run failed</strong>
-                    <span>{activeRun.error}</span>
-                  </article>
-                )}
-                {activeRun?.runVault &&
-                  !["queued", "running"].includes(activeRun.status) && (
-                    <div ref={runVaultPanelAnchor}>
-                      <RunVaultPanel
-                        run={activeRun}
-                        action={runVaultAction}
-                        onAction={(action) => void resolveRunVault(action)}
-                      />
-                    </div>
-                  )}
               </div>
 
               <form className="composer" onSubmit={sendMessage}>
