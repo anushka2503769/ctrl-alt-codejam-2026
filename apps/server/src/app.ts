@@ -23,6 +23,9 @@ const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
 });
 const reviewDiffQuery = z.object({ path: z.string().min(1).max(500) });
+const revisionBody = z.object({
+  instructions: z.string().trim().min(1).max(50_000),
+});
 
 export async function createApp(
   config: AppConfig,
@@ -148,6 +151,12 @@ export async function createApp(
   app.post("/api/runs/:id/discard", async (request) => {
     const { id } = runIdParams.parse(request.params);
     return { run: await service.discardRun(id) };
+  });
+
+  app.post("/api/runs/:id/revisions", async (request, reply) => {
+    const { id } = runIdParams.parse(request.params);
+    const { instructions } = revisionBody.parse(request.body);
+    return reply.code(202).send(await service.requestRevision(id, instructions));
   });
 
   if (config.nodeEnv === "production") {

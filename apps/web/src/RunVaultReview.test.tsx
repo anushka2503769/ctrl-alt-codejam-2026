@@ -6,6 +6,9 @@ import type { AgentRun } from "./types";
 const run: AgentRun = {
   id: "123e4567-e89b-42d3-a456-426614174000",
   agentId: "agent-1",
+  parentRunId: null,
+  supersededByRunId: null,
+  revisionNumber: 0,
   status: "completed",
   prompt: "Review deployment and dependency changes",
   output: "Prepared changes",
@@ -70,7 +73,13 @@ const run: AgentRun = {
 describe("RunVault review workspace", () => {
   it("renders complete safe evidence and quarantine controls", () => {
     const html = renderToStaticMarkup(
-      <RunVaultReview run={run} action={null} onAction={vi.fn()} />,
+      <RunVaultReview
+        run={run}
+        action={null}
+        onAction={vi.fn()}
+        revising={false}
+        onRevision={vi.fn()}
+      />,
     );
     expect(html).toContain("Run review");
     expect(html).toContain("Protected path changed");
@@ -81,6 +90,7 @@ describe("RunVault review workspace", () => {
     expect(html).toContain("Tests passed");
     expect(html).toContain("Approve and promote");
     expect(html).toContain("Discard staged work");
+    expect(html).toContain("Create revision Run");
     expect(html).not.toContain("PROTECTED-CONTENT");
   });
 });

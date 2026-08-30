@@ -40,6 +40,14 @@ import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
+interface RevisionExecutionContext {
+  parentRunId: string;
+  sourceStagingId: string;
+  sourceStagingFingerprint: string;
+  trustedWorkspaceFingerprint: string;
+  baseThreadId: string;
+}
+
 const skippedVerification = (summary: string): RunVaultVerification => ({
   status: "skipped",
   command: null,
@@ -532,6 +540,9 @@ export class AgentService {
     const run: AgentRun = {
       id: runId,
       agentId,
+      parentRunId: null,
+      supersededByRunId: null,
+      revisionNumber: 0,
       status: "queued",
       prompt,
       output: null,
@@ -581,6 +592,104 @@ export class AgentService {
     return { run, message };
   }
 
+  async requestRevision(
+    parentRunId: string,
+    instructions: string,
+  ): Promise<{ run: AgentRun; message: Message }> {
+    if (!isArkConfigured(this.config)) {
+      throw new HttpError(503, "Ark is not configured");
+    }
+    const reservation = await this.store.mutate((database) => {
+      const parent = database.runs.find((run) => run.id === parentRunId);
+      if (!parent) throw new HttpError(404, "Run not found");
+      const decision = parent.runVault;
+      if (
+        decision?.outcome !== "quarantined" ||
+        !decision.stagingWorkspaceId ||
+        !decision.stagingWorkspaceFingerprint ||
+        !decision.trustedWorkspaceFingerprint ||
+        !decision.provisionalThreadId
+      ) {
+        throw new HttpError(409, "Only an intact quarantined Run can be revised");
+      }
+      const agent = database.agents.find((item) => item.id === parent.agentId);
+      if (!agent) throw new HttpError(404, "Agent not found");
+      if (agent.status === "busy") {
+        throw new HttpError(409, "Wait for the active Agent operation to finish");
+      }
+      const agentAtStart = structuredClone(agent);
+      agent.status = "busy";
+      agent.lastError = null;
+      agent.updatedAt = now();
+      return { parent: structuredClone(parent), agentAtStart };
+    });
+
+    try {
+      const review = await this.getRunVaultReview(parentRunId);
+      if (review.availability !== "available") {
+        throw new HttpError(409, review.message);
+      }
+      const parentDecision = reservation.parent.runVault!;
+      const timestamp = now();
+      const runId = randomUUID();
+      const run: AgentRun = {
+        id: runId,
+        agentId: reservation.parent.agentId,
+        parentRunId,
+        supersededByRunId: null,
+        revisionNumber: reservation.parent.revisionNumber + 1,
+        status: "queued",
+        prompt: instructions,
+        output: null,
+        error: null,
+        usage: null,
+        runVault: null,
+        startedAt: null,
+        completedAt: null,
+        createdAt: timestamp,
+      };
+      const message: Message = {
+        id: randomUUID(),
+        agentId: run.agentId,
+        runId,
+        role: "user",
+        content: instructions,
+        createdAt: timestamp,
+      };
+      await this.store.mutate((database) => {
+        const parent = database.runs.find((item) => item.id === parentRunId);
+        const agent = database.agents.find((item) => item.id === run.agentId);
+        if (parent?.runVault?.outcome !== "quarantined" || !agent) {
+          throw new HttpError(409, "Parent Run changed during revision creation");
+        }
+        parent.supersededByRunId = runId;
+        database.runs.push(run);
+        database.messages.push(message);
+      });
+      const context: RevisionExecutionContext = {
+        parentRunId,
+        sourceStagingId: parentDecision.stagingWorkspaceId!,
+        sourceStagingFingerprint: parentDecision.stagingWorkspaceFingerprint!,
+        trustedWorkspaceFingerprint: parentDecision.trustedWorkspaceFingerprint!,
+        baseThreadId: parentDecision.provisionalThreadId!,
+      };
+      const execution = this.executeRun(reservation.agentAtStart, run, context);
+      this.activeExecutions.set(run.agentId, execution);
+      void execution.finally(() => {
+        if (this.activeExecutions.get(run.agentId) === execution) {
+          this.activeExecutions.delete(run.agentId);
+        }
+      }).catch(() => undefined);
+      return { run, message };
+    } catch (error) {
+      await this.releaseDecisionReservation(
+        reservation.agentAtStart.id,
+        reservation.agentAtStart.status,
+      );
+      throw error;
+    }
+  }
+
   async systemInfo(): Promise<Record<string, unknown>> {
     return {
       arkConfigured: isArkConfigured(this.config),
@@ -600,7 +709,11 @@ export class AgentService {
     };
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    revision?: RevisionExecutionContext,
+  ): Promise<void> {
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -618,10 +731,18 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
-      staging = await this.runVaultWorkspaces.createStagingWorkspace(
-        run.id,
-        agentAtStart.workspacePath,
-      );
+      staging = revision
+        ? await this.runVaultWorkspaces.createRevisionStagingWorkspace(
+            run.id,
+            revision.sourceStagingId,
+            agentAtStart.workspacePath,
+            revision.sourceStagingFingerprint,
+            revision.trustedWorkspaceFingerprint,
+          )
+        : await this.runVaultWorkspaces.createStagingWorkspace(
+            run.id,
+            agentAtStart.workspacePath,
+          );
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
@@ -629,9 +750,9 @@ export class AgentService {
         agentId: agentAtStart.id,
         workspacePath: staging.path,
         prompt: run.prompt,
-        threadId: agentAtStart.codexThreadId,
+        threadId: revision?.baseThreadId ?? agentAtStart.codexThreadId,
       });
-      if (runnerResult.threadId === agentAtStart.codexThreadId) {
+      if (runnerResult.threadId === (revision?.baseThreadId ?? agentAtStart.codexThreadId)) {
         throw new Error("Codex did not create a distinct provisional thread");
       }
       if (this.cancellationRequests.has(agentAtStart.id)) {
@@ -743,6 +864,11 @@ export class AgentService {
             () => undefined,
           );
           await this.publishCommittedPromotion(agentAtStart.id, run.id);
+          if (revision) {
+            await this.runVaultWorkspaces
+              .discardStagingWorkspace(revision.sourceStagingId)
+              .catch(() => undefined);
+          }
           return;
         }
       }
@@ -756,6 +882,10 @@ export class AgentService {
       if (decision.outcome === "discarded") {
         await this.runVaultWorkspaces
           .discardStagingWorkspace(staging.id)
+          .catch(() => undefined);
+      } else if (revision && decision.outcome === "quarantined") {
+        await this.runVaultWorkspaces
+          .discardStagingWorkspace(revision.sourceStagingId)
           .catch(() => undefined);
       }
     } catch (error) {

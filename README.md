@@ -30,6 +30,7 @@ Volcengine ECS.
 - Deterministic promote, quarantine, and discard policy
 - Explicit verification status, with `npm test` run when configured
 - Focused Run review with findings, file classifications, and safe bounded diffs
+- Revision Runs that continue quarantined proposals without approving the parent
 - Redacted Run evidence with protected-path metadata
 - Human approval or discard for quarantined work
 - Crash-safe promotion and restart reconciliation

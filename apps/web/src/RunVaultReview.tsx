@@ -12,6 +12,8 @@ interface RunVaultReviewProps {
   run: AgentRun;
   action: RunVaultAction | null;
   onAction: (action: RunVaultAction) => void;
+  revising: boolean;
+  onRevision: (instructions: string) => void;
 }
 
 const blockedDiffCopy: Record<RunVaultTextDiff["status"], string> = {
@@ -33,13 +35,20 @@ function classifications(file: RunVaultFileChange): string[] {
   ].filter((value): value is string => value !== null);
 }
 
-export function RunVaultReview({ run, action, onAction }: RunVaultReviewProps) {
+export function RunVaultReview({
+  run,
+  action,
+  onAction,
+  revising,
+  onRevision,
+}: RunVaultReviewProps) {
   const decision = run.runVault;
   const [review, setReview] = useState<RunVaultReviewEvidence | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [diff, setDiff] = useState<RunVaultTextDiff | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
+  const [revisionInstructions, setRevisionInstructions] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -116,6 +125,18 @@ export function RunVaultReview({ run, action, onAction }: RunVaultReviewProps) {
         <p>{run.prompt}</p>
       </div>
 
+      {(run.parentRunId || run.supersededByRunId) && (
+        <div className="run-lineage">
+          <strong>Run lineage</strong>
+          {run.parentRunId && (
+            <span>Revision {run.revisionNumber} of <code>{run.parentRunId}</code></span>
+          )}
+          {run.supersededByRunId && (
+            <span>Superseded by <code>{run.supersededByRunId}</code></span>
+          )}
+        </div>
+      )}
+
       <div className={`review-availability review-${review?.availability ?? "loading"}`} role="status">
         {reviewError
           ? `Review unavailable: ${reviewError}`
@@ -131,6 +152,39 @@ export function RunVaultReview({ run, action, onAction }: RunVaultReviewProps) {
           review?.availability !== "available"
         }
       />
+
+      {decision.outcome === "quarantined" && (
+        <form
+          className="review-revision"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (revisionInstructions.trim()) onRevision(revisionInstructions.trim());
+          }}
+        >
+          <label htmlFor={`revision-${run.id}`}>Request revisions</label>
+          <p>Create a new child Run from this staged proposal and provisional thread.</p>
+          <textarea
+            id={`revision-${run.id}`}
+            value={revisionInstructions}
+            onChange={(event) => setRevisionInstructions(event.target.value)}
+            placeholder="Describe what the Agent should change before another review…"
+            maxLength={50_000}
+            rows={3}
+            disabled={revising || review?.availability !== "available"}
+          />
+          <button
+            type="submit"
+            className="button button-primary"
+            disabled={
+              revising ||
+              review?.availability !== "available" ||
+              !revisionInstructions.trim()
+            }
+          >
+            {revising ? "Starting revision…" : "Create revision Run"}
+          </button>
+        </form>
+      )}
 
       <section className="review-section" aria-labelledby={`findings-${run.id}`}>
         <h4 id={`findings-${run.id}`}>Findings</h4>

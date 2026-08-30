@@ -99,4 +99,22 @@ describe("HTTP boundary", () => {
     expect(getRunVaultDiff).toHaveBeenCalledWith(runId, "src/index.ts");
     await app.close();
   });
+
+  it("creates revisions through the Run API", async () => {
+    const runId = "123e4567-e89b-42d3-a456-426614174000";
+    const requestRevision = vi.fn(async (id: string, instructions: string) => ({
+      run: { id: "child", parentRunId: id },
+      message: { content: instructions },
+    }));
+    const revisionService = { requestRevision } as unknown as AgentService;
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), revisionService);
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/runs/${runId}/revisions`,
+      payload: { instructions: "remove the risky change" },
+    });
+    expect(response.statusCode).toBe(202);
+    expect(requestRevision).toHaveBeenCalledWith(runId, "remove the risky change");
+    await app.close();
+  });
 });

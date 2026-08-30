@@ -132,6 +132,9 @@ export interface RunVaultTextDiff {
 export interface AgentRun {
   id: string;
   agentId: string;
+  parentRunId: string | null;
+  supersededByRunId: string | null;
+  revisionNumber: number;
   status: RunStatus;
   prompt: string;
   output: string | null;

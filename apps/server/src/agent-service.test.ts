@@ -598,6 +598,96 @@ describe("Agent lifecycle", () => {
     await expect(service.discardRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
   });
 
+  it("creates an independently inspected child revision from retained work", async () => {
+    let call = 0;
+    const seenBaseThreads: Array<string | null> = [];
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        seenBaseThreads.push(request.threadId);
+        if (call === 1) {
+          await mkdir(path.join(request.workspacePath, "deploy"));
+          await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "risk\n");
+          return { output: "Prepared risky work", threadId: "parent-thread", usage: null };
+        }
+        await expect(
+          readFile(path.join(request.workspacePath, "deploy", "app.yml"), "utf8"),
+        ).resolves.toBe("risk\n");
+        const { rm } = await import("node:fs/promises");
+        await rm(path.join(request.workspacePath, "deploy"), { recursive: true });
+        await mkdir(path.join(request.workspacePath, "src"));
+        await writeFile(path.join(request.workspacePath, "src", "safe.ts"), "export {};\n");
+        return { output: "Revised safely", threadId: "child-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Revision builder" });
+    const { run: parent } = await service.sendMessage(agent.id, "prepare deployment");
+    await expect.poll(() => service.getRun(parent.id).status).toBe("completed");
+
+    const { run: child } = await service.requestRevision(
+      parent.id,
+      "Remove the deployment change and use safe source code",
+    );
+    await expect.poll(() => service.getRun(child.id).status).toBe("completed");
+
+    expect(seenBaseThreads).toEqual([null, "parent-thread"]);
+    expect(service.getRun(child.id)).toMatchObject({
+      parentRunId: parent.id,
+      revisionNumber: 1,
+      runVault: { outcome: "promoted", reason: "verified_safe" },
+    });
+    expect(service.getRun(parent.id)).toMatchObject({
+      supersededByRunId: child.id,
+      runVault: { outcome: "quarantined", reason: "protected_path" },
+    });
+    expect(service.getAgent(agent.id).codexThreadId).toBe("child-thread");
+    await expect(
+      readFile(path.join(agent.workspacePath, "src", "safe.ts"), "utf8"),
+    ).resolves.toBe("export {};\n");
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      lstat(path.join(path.dirname(agent.workspacePath), ".staging", parent.id)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps parent evidence and staging when a revision fails", async () => {
+    let call = 0;
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        if (call === 1) {
+          await mkdir(path.join(request.workspacePath, "deploy"));
+          await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "risk\n");
+          return { output: "Parent proposal", threadId: "parent-failure-thread", usage: null };
+        }
+        throw new Error("revision failed");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Failed revision" });
+    const { run: parent } = await service.sendMessage(agent.id, "prepare risk");
+    await expect.poll(() => service.getRun(parent.id).status).toBe("completed");
+    const originalDecision = structuredClone(service.getRun(parent.id).runVault);
+
+    const { run: child } = await service.requestRevision(parent.id, "fix it");
+    await expect.poll(() => service.getRun(child.id).status).toBe("failed");
+
+    expect(service.getRun(parent.id).runVault).toEqual(originalDecision);
+    expect(service.getRun(parent.id).supersededByRunId).toBe(child.id);
+    expect(service.getAgent(agent.id).codexThreadId).toBeNull();
+    await expect(
+      lstat(path.join(path.dirname(agent.workspacePath), ".staging", parent.id)),
+    ).resolves.toBeDefined();
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it("discards quarantined work idempotently without committing its thread", async () => {
     const service = await makeService({
       run: async (request) => {

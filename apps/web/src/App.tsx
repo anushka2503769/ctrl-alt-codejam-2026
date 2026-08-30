@@ -93,7 +93,7 @@ export default function App() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runVaultAction, setRunVaultAction] = useState<{
     runId: string;
-    action: RunVaultAction;
+    action: RunVaultAction | "revise";
   } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -371,6 +371,29 @@ export default function App() {
       await Promise.all([refreshMessages(agentId), refreshAgents()]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setRunVaultAction(null);
+    }
+  };
+
+  const requestRunRevision = async (instructions: string) => {
+    if (!selectedRun?.runVault || selectedRun.runVault.outcome !== "quarantined") {
+      return;
+    }
+    const parent = selectedRun;
+    setRunVaultAction({ runId: parent.id, action: "revise" });
+    setError(null);
+    try {
+      const result = await api.reviseRun(parent.id, instructions);
+      if (selectedIdRef.current === parent.agentId) {
+        setMessages((current) => [...current, result.message]);
+        setRuns((current) => replaceRun(current, result.run));
+        setSelectedRunId(result.run.id);
+      }
+      await pollRun(result.run.id, parent.agentId);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      await Promise.all([refreshRuns(parent.agentId), refreshAgents()]);
     } finally {
       setRunVaultAction(null);
     }
@@ -672,9 +695,12 @@ export default function App() {
                               <RunVaultReview
                                 run={run}
                                 action={runVaultAction?.runId === run.id
+                                  && runVaultAction.action !== "revise"
                                   ? runVaultAction.action
                                   : null}
                                 onAction={(action) => void resolveRunVault(action)}
+                                revising={runVaultAction?.runId === run.id && runVaultAction.action === "revise"}
+                                onRevision={(instructions) => void requestRunRevision(instructions)}
                               />
                             )}
                             {selectedRunId === run.id &&
@@ -724,9 +750,12 @@ export default function App() {
                       <RunVaultReview
                         run={run}
                         action={runVaultAction?.runId === run.id
+                          && runVaultAction.action !== "revise"
                           ? runVaultAction.action
                           : null}
                         onAction={(action) => void resolveRunVault(action)}
+                        revising={runVaultAction?.runId === run.id && runVaultAction.action === "revise"}
+                        onRevision={(instructions) => void requestRunRevision(instructions)}
                       />
                     )}
                     {selectedRunId === run.id && run.error && (

@@ -11,6 +11,9 @@ function run(id: string, status: AgentRun["status"] = "completed"): AgentRun {
   return {
     id,
     agentId: "agent-1",
+    parentRunId: null,
+    supersededByRunId: null,
+    revisionNumber: 0,
     status,
     prompt: `prompt-${id}`,
     output: null,

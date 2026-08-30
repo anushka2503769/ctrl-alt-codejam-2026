@@ -912,6 +912,7 @@ textarea:focus {
 }
 
 .run-review-prompt,
+.run-lineage,
 .review-availability,
 .review-section {
   margin-top: 10px;
@@ -935,6 +936,22 @@ textarea:focus {
   font-size: 9px;
   line-height: 1.5;
 }
+
+.run-lineage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 10px;
+  border: 1px solid #e1dfd7;
+  border-radius: 10px;
+  padding: 9px 11px;
+  background: white;
+  color: #777870;
+  font-size: 9px;
+}
+
+.run-lineage strong { color: #55564f; }
+.run-lineage code { font-size: 8px; }
 
 .review-availability {
   color: #67685f;
@@ -1018,6 +1035,21 @@ textarea:focus {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+.review-revision {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+  border: 1px solid #d9d2f4;
+  border-radius: 10px;
+  padding: 11px;
+  background: #faf8ff;
+}
+
+.review-revision label { font-size: 10px; font-weight: 750; }
+.review-revision p { margin: 0; color: #777870; font-size: 9px; }
+.review-revision textarea { min-height: 72px; font-size: 10px; }
+.review-revision .button { justify-self: end; }
 
 .runvault-panel {
   --runvault-accent: #6d5bd0;

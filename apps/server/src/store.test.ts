@@ -47,6 +47,11 @@ describe("JsonStore", () => {
     await store.initialize();
 
     expect(store.snapshot().runs[0]?.runVault).toBeNull();
+    expect(store.snapshot().runs[0]).toMatchObject({
+      parentRunId: null,
+      supersededByRunId: null,
+      revisionNumber: 0,
+    });
   });
 
   it("adds lifecycle evidence defaults to older RunVault decisions", async () => {

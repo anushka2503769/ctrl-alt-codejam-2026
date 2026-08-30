@@ -428,6 +428,43 @@ export class RunVaultWorkspaceManager {
     }
   }
 
+  async createRevisionStagingWorkspace(
+    id: string,
+    sourceId: string,
+    trustedWorkspacePath: string,
+    expectedSourceFingerprint: string,
+    expectedTrustedFingerprint: string,
+  ): Promise<StagingWorkspace> {
+    const sourcePath = this.stagingPath(sourceId);
+    const destinationPath = this.stagingPath(id);
+    const trustedSnapshot = await this.snapshotWorkspace(trustedWorkspacePath);
+    if (trustedSnapshot.fingerprint !== expectedTrustedFingerprint) {
+      throw new TrustedWorkspaceChangedError(
+        "Trusted workspace changed before revision",
+      );
+    }
+    const sourceSnapshot = await this.snapshotWorkspace(sourcePath);
+    if (sourceSnapshot.fingerprint !== expectedSourceFingerprint) {
+      throw new UnsafeWorkspaceEntryError(
+        "Retained staging changed before revision",
+      );
+    }
+    await mkdir(destinationPath, { recursive: false });
+    try {
+      await copyWorkspaceEntry(sourcePath, destinationPath, sourcePath);
+      const sourceAfterCopy = await this.snapshotWorkspace(sourcePath);
+      if (sourceAfterCopy.fingerprint !== expectedSourceFingerprint) {
+        throw new UnsafeWorkspaceEntryError(
+          "Retained staging changed while revision was created",
+        );
+      }
+      return { id, path: destinationPath, trustedSnapshot };
+    } catch (error) {
+      await rm(destinationPath, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
   async inspectChanges(
     baseline: WorkspaceSnapshot,
     stagingWorkspacePath: string,

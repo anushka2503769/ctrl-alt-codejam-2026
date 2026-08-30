@@ -101,4 +101,12 @@ export const api = {
     request<{ run: AgentRun }>("/api/runs/" + id + "/discard", {
       method: "POST",
     }),
+  reviseRun: (id: string, instructions: string) =>
+    request<{ run: AgentRun; message: Message }>(
+      "/api/runs/" + id + "/revisions",
+      {
+        method: "POST",
+        body: JSON.stringify({ instructions }),
+      },
+    ),
 };

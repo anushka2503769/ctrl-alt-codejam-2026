@@ -24,6 +24,9 @@ export class JsonStore {
         throw new Error("Unsupported database format");
       }
       for (const run of parsed.runs) {
+        run.parentRunId ??= null;
+        run.supersededByRunId ??= null;
+        run.revisionNumber ??= 0;
         run.runVault ??= null;
         if (run.runVault) {
           run.runVault.resolution ??= "policy";
