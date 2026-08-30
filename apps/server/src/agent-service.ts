@@ -19,6 +19,7 @@ import { createVerifier } from "./verifier-factory.js";
 import {
   RunVaultWorkspaceManager,
   TrustedWorkspaceChangedError,
+  UnsafeWorkspaceEntryError,
   type RunVaultPromotion,
   type StagingWorkspace,
 } from "./runvault-workspace.js";
@@ -1175,6 +1176,12 @@ export class AgentService {
         throw new HttpError(
           409,
           "Trusted workspace changed after quarantine; approval was not applied",
+        );
+      }
+      if (error instanceof UnsafeWorkspaceEntryError) {
+        throw new HttpError(
+          409,
+          "Agent-created Git metadata cannot be approved; request a revision that removes it",
         );
       }
       if (error instanceof RunCancelledError) {

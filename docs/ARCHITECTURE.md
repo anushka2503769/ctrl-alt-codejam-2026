@@ -73,6 +73,16 @@ the same installed dependencies as the trusted workspace and avoids network
 installation during a Run. The trade-off is additional copy time and disk use;
 the POC favors repeatable verification over snapshot speed.
 
+Trusted `.git` files and directories, including nested repository metadata, are
+inventoried by path but never copied into staging or content-hashed. A staging
+snapshot records Agent-created `.git` as one bounded protected entry even when
+the directory is empty; it cannot be approved. Version-two promotion markers
+move trusted Git metadata from the backup into the installed workspace and let
+restart recovery complete or reverse a partially transferred set. Version-one
+markers remain readable for interrupted promotions created by older releases.
+Staging also records path-free duration, copied-entry, and estimated-byte
+measurements for later operational reporting.
+
 New symbolic links are quarantined before verification. Verification invokes
 only the configured `npm test` command in a disposable no-network Runtime
 container with a scrubbed environment, dropped capabilities, resource limits,

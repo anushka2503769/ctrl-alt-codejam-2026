@@ -21,6 +21,9 @@ credentials, personal data, or exploit details in an issue.
 - Repository `npm test` scripts execute in a disposable no-network container
   with dropped capabilities and resource limits. Ordinary containers are still
   not a hardened multi-tenant sandbox.
+- Trusted `.git` files and directories are not copied or content-hashed.
+  Agent-created `.git` metadata is quarantined and cannot be approved; durable
+  promotion recovery preserves trusted repository metadata separately.
 - Broad outbound network access
 - Prompt-triggered command and file execution
 - Ark key available to the server and active Runtime container

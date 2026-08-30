@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -108,6 +109,8 @@ describe("RunVaultWorkspaceManager", () => {
     await writeFile(path.join(trusted, "node_modules", "fixture.js"), "module.exports = 1;\n");
     await mkdir(path.join(trusted, ".codex"));
     await writeFile(path.join(trusted, ".codex", "session.json"), "secret metadata");
+    await mkdir(path.join(trusted, ".git"));
+    await writeFile(path.join(trusted, ".git", "config"), "trusted git metadata");
 
     const staging = await stage();
 
@@ -118,6 +121,44 @@ describe("RunVaultWorkspaceManager", () => {
     await expect(lstat(path.join(staging.path, ".codex"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+    await expect(lstat(path.join(staging.path, ".git"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("does not traverse, hash, or copy trusted root and nested Git metadata", async () => {
+    await writeFile(path.join(trusted, "source.ts"), "x");
+    await mkdir(path.join(trusted, ".git", "objects"), { recursive: true });
+    await writeFile(path.join(trusted, ".git", "objects", "large"), "g".repeat(4096));
+    await mkdir(path.join(trusted, "packages", "nested"), { recursive: true });
+    await writeFile(path.join(trusted, "packages", "nested", "index.ts"), "nested");
+    await writeFile(
+      path.join(trusted, "packages", "nested", ".git"),
+      "gitdir: ../../.git/modules/nested\n",
+    );
+    const before = await manager.snapshotWorkspace(trusted);
+
+    const staging = await stage();
+
+    expect(before.entries.map((entry) => entry.path)).not.toContain(".git");
+    expect(before.entries.map((entry) => entry.path)).not.toContain(
+      "packages/nested/.git",
+    );
+    expect(before.estimatedBytes).toBe("x".length + "nested".length);
+    expect(staging.metrics.estimatedCopiedBytes).toBe(
+      "x".length + "nested".length,
+    );
+    expect(staging.metrics.durationMs).toBeGreaterThanOrEqual(0);
+    await expect(lstat(path.join(staging.path, ".git"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      lstat(path.join(staging.path, "packages", "nested", ".git")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await writeFile(path.join(trusted, ".git", "objects", "large"), "changed");
+    expect((await manager.snapshotWorkspace(trusted)).fingerprint).toBe(
+      before.fingerprint,
+    );
   });
 
   it("keeps the trusted workspace unchanged when staging is edited", async () => {
@@ -183,6 +224,8 @@ describe("RunVaultWorkspaceManager", () => {
     [".env.local", true],
     ["AGENTS.md", true],
     [".codex/session.json", true],
+    [".git", true],
+    ["packages/nested/.git/config", true],
     [".staging/nested", true],
     [".github/workflows/release.yml", true],
     ["infra/main.tf", true],
@@ -234,6 +277,88 @@ describe("RunVaultWorkspaceManager", () => {
         protected: true,
       }),
     ]);
+  });
+
+  it("detects even empty Agent-created Git metadata and blocks promotion", async () => {
+    const staging = await stage();
+    await mkdir(path.join(staging.path, ".git"));
+
+    const inspection = await manager.inspectChanges(
+      staging.trustedSnapshot,
+      staging.path,
+    );
+
+    expect(inspection.changes).toEqual([
+      expect.objectContaining({
+        path: ".git",
+        kind: "added",
+        protected: true,
+      }),
+    ]);
+    await expect(
+      manager.beginPromotion(
+        staging.id,
+        trusted,
+        staging.trustedSnapshot.fingerprint,
+      ),
+    ).rejects.toThrow("Agent-created Git metadata cannot be promoted");
+  });
+
+  it("retains Agent-created Git metadata in revision staging until removed", async () => {
+    const parent = await stage("parent-run");
+    await mkdir(path.join(parent.path, "nested", ".git"), { recursive: true });
+    const parentInspection = await manager.inspectChanges(
+      parent.trustedSnapshot,
+      parent.path,
+    );
+
+    const child = await manager.createRevisionStagingWorkspace(
+      "child-run",
+      parent.id,
+      trusted,
+      parentInspection.stagingFingerprint,
+      parent.trustedSnapshot.fingerprint,
+    );
+
+    await expect(lstat(path.join(child.path, "nested", ".git"))).resolves
+      .toBeDefined();
+    const childInspection = await manager.inspectChanges(
+      child.trustedSnapshot,
+      child.path,
+    );
+    expect(childInspection.changes).toContainEqual(
+      expect.objectContaining({ path: "nested/.git", protected: true }),
+    );
+  });
+
+  it("quarantines removal of a parent that contains preserved nested Git metadata", async () => {
+    await mkdir(path.join(trusted, "nested"));
+    await writeFile(path.join(trusted, "nested", "source.ts"), "source\n");
+    await writeFile(path.join(trusted, "nested", ".git"), "nested metadata\n");
+    const staging = await stage();
+    await rm(path.join(staging.path, "nested"), { recursive: true });
+
+    const inspection = await manager.inspectChanges(
+      staging.trustedSnapshot,
+      staging.path,
+    );
+
+    expect(inspection.changes).toContainEqual(
+      expect.objectContaining({
+        path: "nested/.git",
+        kind: "deleted",
+        protected: true,
+      }),
+    );
+    await expect(
+      manager.beginPromotion(
+        staging.id,
+        trusted,
+        staging.trustedSnapshot.fingerprint,
+      ),
+    ).rejects.toThrow("parent was removed");
+    await expect(readFile(path.join(trusted, "nested", ".git"), "utf8"))
+      .resolves.toBe("nested metadata\n");
   });
 
   it("detects a new internal symbolic link without following it", async () => {
@@ -308,13 +433,191 @@ describe("RunVaultWorkspaceManager", () => {
     );
     expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe("staged\n");
     await expect(readFile(manager.promotionMarkerPath(staging.id), "utf8"))
-      .resolves.toContain('"phase":"installed"');
+      .resolves.toContain('"phase":"metadata_installed"');
 
     await manager.rollbackPromotion(promotion);
     expect(await readFile(path.join(trusted, "state.txt"), "utf8")).toBe("trusted\n");
     expect(await readFile(path.join(staging.path, "state.txt"), "utf8")).toBe("staged\n");
     await expect(lstat(manager.promotionMarkerPath(staging.id))).rejects
       .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves root and nested trusted Git metadata through promotion rollback", async () => {
+    await mkdir(path.join(trusted, ".git"));
+    await writeFile(path.join(trusted, ".git", "config"), "root metadata\n");
+    await mkdir(path.join(trusted, "nested"));
+    await writeFile(path.join(trusted, "nested", "source.ts"), "trusted\n");
+    await writeFile(
+      path.join(trusted, "nested", ".git"),
+      "gitdir: ../.git/modules/nested\n",
+    );
+    const staging = await stage();
+    await writeFile(path.join(staging.path, "nested", "source.ts"), "staged\n");
+
+    const promotion = await manager.beginPromotion(
+      staging.id,
+      trusted,
+      staging.trustedSnapshot.fingerprint,
+    );
+
+    await expect(readFile(path.join(trusted, ".git", "config"), "utf8"))
+      .resolves.toBe("root metadata\n");
+    await expect(readFile(path.join(trusted, "nested", ".git"), "utf8"))
+      .resolves.toContain("gitdir:");
+    await manager.rollbackPromotion(promotion);
+    await expect(readFile(path.join(trusted, ".git", "config"), "utf8"))
+      .resolves.toBe("root metadata\n");
+    await expect(readFile(path.join(trusted, "nested", ".git"), "utf8"))
+      .resolves.toContain("gitdir:");
+    await expect(lstat(path.join(staging.path, ".git"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(lstat(path.join(staging.path, "nested", ".git"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves a Git worktree metadata file through committed promotion", async () => {
+    await writeFile(
+      path.join(trusted, ".git"),
+      "gitdir: /srv/repository/.git/worktrees/agent-1\n",
+    );
+    await writeFile(path.join(trusted, "state.txt"), "trusted\n");
+    const staging = await stage("run-worktree-file");
+    await writeFile(path.join(staging.path, "state.txt"), "staged\n");
+
+    const promotion = await manager.beginPromotion(
+      staging.id,
+      trusted,
+      staging.trustedSnapshot.fingerprint,
+    );
+    await manager.finalizePromotion(promotion);
+
+    await expect(readFile(path.join(trusted, ".git"), "utf8")).resolves.toBe(
+      "gitdir: /srv/repository/.git/worktrees/agent-1\n",
+    );
+    await expect(readFile(path.join(trusted, "state.txt"), "utf8")).resolves
+      .toBe("staged\n");
+  });
+
+  it("finishes a committed promotion interrupted before Git metadata transfer", async () => {
+    await mkdir(path.join(trusted, ".git"));
+    await writeFile(path.join(trusted, ".git", "config"), "preserved\n");
+    await writeFile(path.join(trusted, "state.txt"), "trusted\n");
+    const staging = await stage("run-git-recovery");
+    await writeFile(path.join(staging.path, "state.txt"), "staged\n");
+    const backup = path.join(root, ".staging", `${staging.id}.backup`);
+    await rename(trusted, backup);
+    await rename(staging.path, trusted);
+    await writeFile(
+      manager.promotionMarkerPath(staging.id),
+      JSON.stringify({
+        version: 2,
+        runId: staging.id,
+        agentId: "agent-1",
+        phase: "installed",
+        gitMetadataPaths: [".git"],
+      }) + "\n",
+    );
+
+    const restarted = new RunVaultWorkspaceManager(root);
+    await restarted.reconcileTransactions(
+      databaseForRun(staging.id, "promoted"),
+    );
+
+    await expect(readFile(path.join(trusted, "state.txt"), "utf8")).resolves
+      .toBe("staged\n");
+    await expect(readFile(path.join(trusted, ".git", "config"), "utf8"))
+      .resolves.toBe("preserved\n");
+    await expect(lstat(backup)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rolls back an interrupted partial Git metadata transfer", async () => {
+    await mkdir(path.join(trusted, ".git"));
+    await writeFile(path.join(trusted, ".git", "config"), "root metadata\n");
+    await mkdir(path.join(trusted, "nested"));
+    await writeFile(path.join(trusted, "nested", "source.ts"), "trusted\n");
+    await writeFile(path.join(trusted, "nested", ".git"), "nested metadata\n");
+    const staging = await stage("run-git-rollback");
+    await writeFile(path.join(staging.path, "nested", "source.ts"), "staged\n");
+    const backup = path.join(root, ".staging", `${staging.id}.backup`);
+    await rename(trusted, backup);
+    await rename(staging.path, trusted);
+    await rename(path.join(backup, ".git"), path.join(trusted, ".git"));
+    await writeFile(
+      manager.promotionMarkerPath(staging.id),
+      JSON.stringify({
+        version: 2,
+        runId: staging.id,
+        agentId: "agent-1",
+        phase: "installed",
+        gitMetadataPaths: [".git", "nested/.git"],
+      }) + "\n",
+    );
+
+    const restarted = new RunVaultWorkspaceManager(root);
+    await restarted.reconcileTransactions(
+      databaseForRun(staging.id, "quarantined"),
+    );
+
+    await expect(readFile(path.join(trusted, ".git", "config"), "utf8"))
+      .resolves.toBe("root metadata\n");
+    await expect(readFile(path.join(trusted, "nested", ".git"), "utf8"))
+      .resolves.toBe("nested metadata\n");
+    await expect(readFile(path.join(staging.path, "nested", "source.ts"), "utf8"))
+      .resolves.toBe("staged\n");
+    await expect(lstat(path.join(staging.path, ".git"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("reconciles legacy version-one promotion markers", async () => {
+    await mkdir(path.join(trusted, ".git"));
+    await writeFile(path.join(trusted, ".git", "config"), "legacy metadata\n");
+    await writeFile(path.join(trusted, "state.txt"), "trusted\n");
+    const staging = await stage("run-legacy-marker");
+    await writeFile(path.join(staging.path, "state.txt"), "staged\n");
+    await mkdir(path.join(staging.path, ".git"));
+    await writeFile(path.join(staging.path, ".git", "config"), "legacy metadata\n");
+    const backup = path.join(root, ".staging", `${staging.id}.backup`);
+    await rename(trusted, backup);
+    await rename(staging.path, trusted);
+    await writeFile(
+      manager.promotionMarkerPath(staging.id),
+      JSON.stringify({
+        version: 1,
+        runId: staging.id,
+        agentId: "agent-1",
+        phase: "installed",
+      }) + "\n",
+    );
+
+    const restarted = new RunVaultWorkspaceManager(root);
+    await restarted.reconcileTransactions(
+      databaseForRun(staging.id, "promoted"),
+    );
+
+    await expect(readFile(path.join(trusted, ".git", "config"), "utf8"))
+      .resolves.toBe("legacy metadata\n");
+    await expect(readFile(path.join(trusted, "state.txt"), "utf8")).resolves
+      .toBe("staged\n");
+  });
+
+  it("rejects unsafe Git metadata paths in promotion markers", async () => {
+    const staging = await stage("run-invalid-marker");
+    await writeFile(
+      manager.promotionMarkerPath(staging.id),
+      JSON.stringify({
+        version: 2,
+        runId: staging.id,
+        agentId: "agent-1",
+        phase: "prepared",
+        gitMetadataPaths: ["../.git"],
+      }) + "\n",
+    );
+
+    await expect(
+      manager.reconcileTransactions(databaseForRun(staging.id, "quarantined")),
+    ).rejects.toThrow("Invalid RunVault promotion marker");
   });
 
   it("rolls back an installed promotion when the database did not commit it", async () => {

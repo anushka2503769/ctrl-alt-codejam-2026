@@ -22,7 +22,10 @@ import {
 } from "./runvault-review.js";
 import type { Database, RunVaultFileChange } from "./types.js";
 
-const RESERVED_DIRECTORY_NAMES = new Set([".codex", ".staging"]);
+const PLATFORM_RESERVED_DIRECTORY_NAMES = new Set([".codex", ".staging"]);
+const GIT_METADATA_NAME = ".git";
+const MAX_GIT_METADATA_PATHS = 1_024;
+const MAX_GIT_METADATA_PATH_BYTES = 4_096;
 const BINARY_EXTENSIONS = new Set([
   ".class",
   ".dll",
@@ -76,17 +79,28 @@ export interface WorkspaceEntrySnapshot {
   digest: string;
   mode: number;
   binary: boolean;
+  size: number;
 }
 
 export interface WorkspaceSnapshot {
   fingerprint: string;
   entries: WorkspaceEntrySnapshot[];
+  entryCount: number;
+  estimatedBytes: number;
+  gitMetadataPaths: string[];
+}
+
+export interface StagingWorkspaceMetrics {
+  durationMs: number;
+  copiedEntryCount: number;
+  estimatedCopiedBytes: number;
 }
 
 export interface StagingWorkspace {
   id: string;
   path: string;
   trustedSnapshot: WorkspaceSnapshot;
+  metrics: StagingWorkspaceMetrics;
 }
 
 export interface RunVaultWorkspaceInspection {
@@ -101,20 +115,36 @@ export interface RunVaultPromotion {
   stagingWorkspacePath: string;
   backupWorkspacePath: string;
   markerPath: string;
+  gitMetadataPaths: string[];
+  markerVersion: 1 | 2;
 }
 
 export type ReviewFileResult =
   | { status: "available"; text: string }
   | { status: "missing" | "binary" | "symbolic_link" | "too_large" };
 
-type PromotionPhase = "prepared" | "installed" | "committed";
+type PromotionPhase =
+  | "prepared"
+  | "installed"
+  | "metadata_installed"
+  | "committed";
 
-interface PromotionMarker {
+interface PromotionMarkerV1 {
   version: 1;
   runId: string;
   agentId: string;
-  phase: PromotionPhase;
+  phase: "prepared" | "installed" | "committed";
 }
+
+interface PromotionMarkerV2 {
+  version: 2;
+  runId: string;
+  agentId: string;
+  phase: PromotionPhase;
+  gitMetadataPaths: string[];
+}
+
+type PromotionMarker = PromotionMarkerV1 | PromotionMarkerV2;
 
 export class UnsafeWorkspaceEntryError extends Error {}
 export class TrustedWorkspaceChangedError extends Error {}
@@ -143,13 +173,30 @@ async function pathExists(candidate: string): Promise<boolean> {
 function isPromotionMarker(value: unknown): value is PromotionMarker {
   if (!value || typeof value !== "object") return false;
   const marker = value as Partial<PromotionMarker>;
+  if (typeof marker.runId !== "string" || typeof marker.agentId !== "string") {
+    return false;
+  }
+  if (marker.version === 1) {
+    return (
+      marker.phase === "prepared" ||
+      marker.phase === "installed" ||
+      marker.phase === "committed"
+    );
+  }
+  if (marker.version !== 2 || !Array.isArray(marker.gitMetadataPaths)) {
+    return false;
+  }
   return (
-    marker.version === 1 &&
-    typeof marker.runId === "string" &&
-    typeof marker.agentId === "string" &&
     (marker.phase === "prepared" ||
       marker.phase === "installed" ||
-      marker.phase === "committed")
+      marker.phase === "metadata_installed" ||
+      marker.phase === "committed") &&
+    marker.gitMetadataPaths.length <= MAX_GIT_METADATA_PATHS &&
+    marker.gitMetadataPaths.every(
+      (candidate) =>
+        typeof candidate === "string" && isValidGitMetadataPath(candidate),
+    ) &&
+    new Set(marker.gitMetadataPaths).size === marker.gitMetadataPaths.length
   );
 }
 
@@ -157,15 +204,45 @@ function toRelativePath(root: string, absolutePath: string): string {
   return path.relative(root, absolutePath).split(path.sep).join("/");
 }
 
-function shouldExclude(relativePath: string): boolean {
-  return relativePath
-    .split("/")
-    .some((segment) => RESERVED_DIRECTORY_NAMES.has(segment));
+function pathSegments(relativePath: string): string[] {
+  return relativePath.replaceAll("\\", "/").split("/");
+}
+
+function isGitMetadataName(name: string): boolean {
+  return name.toLowerCase() === GIT_METADATA_NAME;
+}
+
+function isGitMetadataPath(relativePath: string): boolean {
+  return pathSegments(relativePath).some(isGitMetadataName);
+}
+
+function isValidGitMetadataPath(relativePath: string): boolean {
+  try {
+    return (
+      validateReviewPath(relativePath) === relativePath &&
+      Buffer.byteLength(relativePath) <= MAX_GIT_METADATA_PATH_BYTES &&
+      isGitMetadataName(path.posix.basename(relativePath))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function shouldExcludeFromCopy(
+  relativePath: string,
+  excludeGitMetadata: boolean,
+): boolean {
+  const segments = pathSegments(relativePath);
+  return (
+    segments.some((segment) => PLATFORM_RESERVED_DIRECTORY_NAMES.has(segment)) ||
+    (excludeGitMetadata && segments.some(isGitMetadataName))
+  );
 }
 
 export function isProtectedRunVaultPath(relativePath: string): boolean {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\//, "");
   return (
+    isGitMetadataPath(normalized) ||
     normalized === ".env" ||
     normalized.startsWith(".env.") ||
     normalized === ".codex" ||
@@ -232,7 +309,11 @@ async function collectEntries(
   root: string,
   current: string,
   entries: WorkspaceEntrySnapshot[],
-  excludeReservedDirectories: boolean,
+  options: {
+    excludePlatformMetadata: boolean;
+    excludeGitMetadata: boolean;
+    collapseGitMetadata: boolean;
+  },
 ): Promise<void> {
   const children = await readdir(current, { withFileTypes: true });
   children.sort((left, right) => left.name.localeCompare(right.name));
@@ -240,9 +321,52 @@ async function collectEntries(
   for (const child of children) {
     const absolutePath = path.join(current, child.name);
     const relativePath = toRelativePath(root, absolutePath);
-    if (excludeReservedDirectories && shouldExclude(relativePath)) continue;
+    const segments = pathSegments(relativePath);
+    if (
+      options.excludePlatformMetadata &&
+      segments.some((segment) => PLATFORM_RESERVED_DIRECTORY_NAMES.has(segment))
+    ) {
+      continue;
+    }
+    if (options.excludeGitMetadata && isGitMetadataPath(relativePath)) continue;
 
     const stats = await lstat(absolutePath);
+    if (isGitMetadataName(child.name) && options.collapseGitMetadata) {
+      if (stats.isDirectory()) {
+        entries.push({
+          path: relativePath,
+          type: "directory",
+          digest: "git-metadata",
+          mode: stats.mode & 0o777,
+          binary: true,
+          size: 0,
+        });
+        continue;
+      }
+      if (stats.isFile()) {
+        entries.push({
+          path: relativePath,
+          type: "file",
+          digest: `git-metadata:${stats.size}`,
+          mode: stats.mode & 0o777,
+          binary: true,
+          size: stats.size,
+        });
+        continue;
+      }
+      if (stats.isSymbolicLink()) {
+        const target = await readlink(absolutePath);
+        entries.push({
+          path: relativePath,
+          type: "symbolic-link",
+          digest: `git-metadata-link:${Buffer.byteLength(target)}`,
+          mode: stats.mode & 0o777,
+          binary: true,
+          size: Buffer.byteLength(target),
+        });
+        continue;
+      }
+    }
     if (stats.isDirectory()) {
       entries.push({
         path: relativePath,
@@ -250,13 +374,9 @@ async function collectEntries(
         digest: "",
         mode: stats.mode & 0o777,
         binary: false,
+        size: 0,
       });
-      await collectEntries(
-        root,
-        absolutePath,
-        entries,
-        excludeReservedDirectories,
-      );
+      await collectEntries(root, absolutePath, entries, options);
       continue;
     }
     if (stats.isFile()) {
@@ -267,6 +387,7 @@ async function collectEntries(
         digest,
         mode: stats.mode & 0o777,
         binary,
+        size: stats.size,
       });
       continue;
     }
@@ -278,6 +399,7 @@ async function collectEntries(
         digest: createHash("sha256").update(target).digest("hex"),
         mode: stats.mode & 0o777,
         binary: false,
+        size: Buffer.byteLength(target),
       });
       continue;
     }
@@ -304,28 +426,40 @@ function fingerprintEntries(entries: WorkspaceEntrySnapshot[]): string {
 }
 
 async function copyWorkspaceEntry(
-  trustedRoot: string,
+  sourceRoot: string,
   stagingRoot: string,
   sourcePath: string,
-): Promise<void> {
+  excludeGitMetadata: boolean,
+): Promise<{ entryCount: number; estimatedBytes: number }> {
   const children = await readdir(sourcePath, { withFileTypes: true });
   children.sort((left, right) => left.name.localeCompare(right.name));
+  let entryCount = 0;
+  let estimatedBytes = 0;
 
   for (const child of children) {
     const source = path.join(sourcePath, child.name);
-    const relativePath = toRelativePath(trustedRoot, source);
-    if (shouldExclude(relativePath)) continue;
+    const relativePath = toRelativePath(sourceRoot, source);
+    if (shouldExcludeFromCopy(relativePath, excludeGitMetadata)) continue;
     const destination = path.join(stagingRoot, ...relativePath.split("/"));
     const stats = await lstat(source);
+    entryCount += 1;
 
     if (stats.isDirectory()) {
       await mkdir(destination, { mode: stats.mode & 0o777 });
-      await copyWorkspaceEntry(trustedRoot, stagingRoot, source);
+      const nested = await copyWorkspaceEntry(
+        sourceRoot,
+        stagingRoot,
+        source,
+        excludeGitMetadata,
+      );
+      entryCount += nested.entryCount;
+      estimatedBytes += nested.estimatedBytes;
       continue;
     }
     if (stats.isFile()) {
       await copyFile(source, destination);
       await chmod(destination, stats.mode & 0o777);
+      estimatedBytes += stats.size;
       continue;
     }
     if (stats.isSymbolicLink()) {
@@ -336,18 +470,126 @@ async function copyWorkspaceEntry(
         );
       }
       const resolvedTarget = path.resolve(path.dirname(source), target);
-      if (!isInside(trustedRoot, resolvedTarget)) {
+      if (!isInside(sourceRoot, resolvedTarget)) {
         throw new UnsafeWorkspaceEntryError(
           `Symbolic link escapes the workspace at ${relativePath}`,
         );
       }
       await symlink(target, destination);
+      estimatedBytes += Buffer.byteLength(target);
       continue;
     }
 
     throw new UnsafeWorkspaceEntryError(
       `Unsupported workspace entry type at ${relativePath}`,
     );
+  }
+  return { entryCount, estimatedBytes };
+}
+
+async function collectGitMetadataPaths(
+  root: string,
+  current: string = root,
+  results: string[] = [],
+): Promise<string[]> {
+  const children = await readdir(current, { withFileTypes: true });
+  children.sort((left, right) => left.name.localeCompare(right.name));
+
+  for (const child of children) {
+    const candidate = path.join(current, child.name);
+    const relativePath = toRelativePath(root, candidate);
+    if (
+      pathSegments(relativePath).some((segment) =>
+        PLATFORM_RESERVED_DIRECTORY_NAMES.has(segment),
+      )
+    ) {
+      continue;
+    }
+    const stats = await lstat(candidate);
+    if (isGitMetadataName(child.name)) {
+      if (!stats.isDirectory() && !stats.isFile()) {
+        throw new UnsafeWorkspaceEntryError(
+          `Git metadata must be a file or directory at ${relativePath}`,
+        );
+      }
+      results.push(relativePath);
+      if (results.length > MAX_GIT_METADATA_PATHS) {
+        throw new UnsafeWorkspaceEntryError(
+          `Workspace contains more than ${MAX_GIT_METADATA_PATHS} Git metadata paths`,
+        );
+      }
+      continue;
+    }
+    if (stats.isDirectory()) {
+      await collectGitMetadataPaths(root, candidate, results);
+    }
+  }
+  return results;
+}
+
+async function moveGitMetadataPaths(
+  sourceRoot: string,
+  destinationRoot: string,
+  relativePaths: string[],
+): Promise<void> {
+  for (const relativePath of relativePaths) {
+    if (!isValidGitMetadataPath(relativePath)) {
+      throw new Error("Invalid Git metadata path in promotion");
+    }
+    const source = path.join(sourceRoot, ...relativePath.split("/"));
+    const destination = path.join(destinationRoot, ...relativePath.split("/"));
+    const sourceExists = await pathExists(source);
+    const destinationExists = await pathExists(destination);
+    if (sourceExists && destinationExists) {
+      throw new Error(`RunVault found conflicting Git metadata at ${relativePath}`);
+    }
+    if (!sourceExists) {
+      if (destinationExists) continue;
+      throw new Error(`RunVault cannot recover Git metadata at ${relativePath}`);
+    }
+    const destinationParent = path.dirname(destination);
+    let parentStats;
+    try {
+      parentStats = await lstat(destinationParent);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new UnsafeWorkspaceEntryError(
+          `Cannot preserve nested Git metadata because its parent was removed: ${relativePath}`,
+        );
+      }
+      throw error;
+    }
+    if (!parentStats.isDirectory()) {
+      throw new UnsafeWorkspaceEntryError(
+        `Cannot preserve Git metadata under a non-directory path: ${relativePath}`,
+      );
+    }
+    await rename(source, destination);
+  }
+}
+
+async function assertGitMetadataInventory(
+  promotion: RunVaultPromotion,
+): Promise<void> {
+  const discovered = new Set<string>();
+  for (const root of [
+    promotion.backupWorkspacePath,
+    promotion.trustedWorkspacePath,
+  ]) {
+    if (!(await pathExists(root))) continue;
+    for (const relativePath of await collectGitMetadataPaths(root)) {
+      if (discovered.has(relativePath)) {
+        throw new Error(
+          `RunVault found duplicate Git metadata during promotion: ${relativePath}`,
+        );
+      }
+      discovered.add(relativePath);
+    }
+  }
+  const expected = [...promotion.gitMetadataPaths].sort();
+  const actual = [...discovered].sort();
+  if (actual.length !== expected.length || actual.some((item, index) => item !== expected[index])) {
+    throw new Error("Trusted Git metadata changed during promotion");
   }
 }
 
@@ -390,19 +632,36 @@ export class RunVaultWorkspaceManager {
       throw new Error("Workspace path is outside the managed workspace root");
     }
     const entries: WorkspaceEntrySnapshot[] = [];
+    const trustedWorkspace = !isInside(this.stagingRoot, resolvedPath);
     await collectEntries(
       resolvedPath,
       resolvedPath,
       entries,
-      !isInside(this.stagingRoot, resolvedPath),
+      {
+        excludePlatformMetadata: trustedWorkspace,
+        excludeGitMetadata: trustedWorkspace,
+        collapseGitMetadata: !trustedWorkspace,
+      },
     );
-    return { entries, fingerprint: fingerprintEntries(entries) };
+    const gitMetadataPaths = trustedWorkspace
+      ? await collectGitMetadataPaths(resolvedPath)
+      : entries
+          .filter((entry) => isGitMetadataPath(entry.path))
+          .map((entry) => entry.path);
+    return {
+      entries,
+      fingerprint: fingerprintEntries(entries),
+      entryCount: entries.length,
+      estimatedBytes: entries.reduce((total, entry) => total + entry.size, 0),
+      gitMetadataPaths,
+    };
   }
 
   async createStagingWorkspace(
     id: string,
     trustedWorkspacePath: string,
   ): Promise<StagingWorkspace> {
+    const startedAt = performance.now();
     const stagingPath = this.stagingPath(id);
     const trustedPath = path.resolve(trustedWorkspacePath);
     if (
@@ -416,12 +675,26 @@ export class RunVaultWorkspaceManager {
     const trustedSnapshot = await this.snapshotWorkspace(trustedPath);
     await mkdir(stagingPath, { recursive: false });
     try {
-      await copyWorkspaceEntry(trustedPath, stagingPath, trustedPath);
+      const copied = await copyWorkspaceEntry(
+        trustedPath,
+        stagingPath,
+        trustedPath,
+        true,
+      );
       const afterCopy = await this.snapshotWorkspace(trustedPath);
       if (afterCopy.fingerprint !== trustedSnapshot.fingerprint) {
         throw new Error("Trusted workspace changed while staging was created");
       }
-      return { id, path: stagingPath, trustedSnapshot };
+      return {
+        id,
+        path: stagingPath,
+        trustedSnapshot,
+        metrics: {
+          durationMs: performance.now() - startedAt,
+          copiedEntryCount: copied.entryCount,
+          estimatedCopiedBytes: copied.estimatedBytes,
+        },
+      };
     } catch (error) {
       await rm(stagingPath, { recursive: true, force: true });
       throw error;
@@ -435,6 +708,7 @@ export class RunVaultWorkspaceManager {
     expectedSourceFingerprint: string,
     expectedTrustedFingerprint: string,
   ): Promise<StagingWorkspace> {
+    const startedAt = performance.now();
     const sourcePath = this.stagingPath(sourceId);
     const destinationPath = this.stagingPath(id);
     const trustedSnapshot = await this.snapshotWorkspace(trustedWorkspacePath);
@@ -451,14 +725,28 @@ export class RunVaultWorkspaceManager {
     }
     await mkdir(destinationPath, { recursive: false });
     try {
-      await copyWorkspaceEntry(sourcePath, destinationPath, sourcePath);
+      const copied = await copyWorkspaceEntry(
+        sourcePath,
+        destinationPath,
+        sourcePath,
+        false,
+      );
       const sourceAfterCopy = await this.snapshotWorkspace(sourcePath);
       if (sourceAfterCopy.fingerprint !== expectedSourceFingerprint) {
         throw new UnsafeWorkspaceEntryError(
           "Retained staging changed while revision was created",
         );
       }
-      return { id, path: destinationPath, trustedSnapshot };
+      return {
+        id,
+        path: destinationPath,
+        trustedSnapshot,
+        metrics: {
+          durationMs: performance.now() - startedAt,
+          copiedEntryCount: copied.entryCount,
+          estimatedCopiedBytes: copied.estimatedBytes,
+        },
+      };
     } catch (error) {
       await rm(destinationPath, { recursive: true, force: true });
       throw error;
@@ -487,7 +775,9 @@ export class RunVaultWorkspaceManager {
       const after = stagingByPath.get(relativePath);
       if (before?.type === "directory" && after?.type === "directory") continue;
       if (before && after && entriesEqual(before, after)) continue;
-      if (!before && after?.type === "directory") continue;
+      if (!before && after?.type === "directory" && !isGitMetadataPath(relativePath)) {
+        continue;
+      }
       if (before?.type === "directory" && !after) continue;
 
       const kind = !before ? "added" : !after ? "deleted" : "modified";
@@ -513,6 +803,25 @@ export class RunVaultWorkspaceManager {
         symbolicLink: introducedSymbolicLink,
       });
     }
+
+    for (const gitMetadataPath of baseline.gitMetadataPaths) {
+      const parentPath = path.posix.dirname(gitMetadataPath);
+      if (parentPath === ".") continue;
+      const stagedParent = stagingByPath.get(parentPath);
+      if (stagedParent?.type === "directory") continue;
+      if (!changes.some((change) => change.path === gitMetadataPath)) {
+        changes.push({
+          path: gitMetadataPath,
+          kind: "deleted",
+          protected: true,
+          dependencyFile: false,
+          executable: false,
+          binary: true,
+          symbolicLink: false,
+        });
+      }
+    }
+    changes.sort((left, right) => left.path.localeCompare(right.path));
 
     return { changes, stagingFingerprint: stagingSnapshot.fingerprint };
   }
@@ -585,6 +894,13 @@ export class RunVaultWorkspaceManager {
         "Trusted workspace changed before promotion",
       );
     }
+    const stagingSnapshot = await this.snapshotWorkspace(stagingWorkspacePath);
+    if (stagingSnapshot.entries.some((entry) => isGitMetadataPath(entry.path))) {
+      throw new UnsafeWorkspaceEntryError(
+        "Agent-created Git metadata cannot be promoted",
+      );
+    }
+    const gitMetadataPaths = current.gitMetadataPaths;
 
     const backupWorkspacePath = path.join(this.stagingRoot, `${id}.backup`);
     const markerPath = this.promotionMarkerPath(id);
@@ -595,12 +911,22 @@ export class RunVaultWorkspaceManager {
       stagingWorkspacePath,
       backupWorkspacePath,
       markerPath,
+      gitMetadataPaths,
+      markerVersion: 2,
     };
     await this.writePromotionMarker(promotion, "prepared");
     try {
       await rename(trustedPath, backupWorkspacePath);
+      await assertGitMetadataInventory(promotion);
       await rename(stagingWorkspacePath, trustedPath);
       await this.writePromotionMarker(promotion, "installed");
+      await moveGitMetadataPaths(
+        backupWorkspacePath,
+        trustedPath,
+        gitMetadataPaths,
+      );
+      await assertGitMetadataInventory(promotion);
+      await this.writePromotionMarker(promotion, "metadata_installed");
     } catch (error) {
       await this.restorePrePromotionState(promotion);
       await rm(markerPath, { force: true });
@@ -655,6 +981,9 @@ export class RunVaultWorkspaceManager {
           `${parsed.runId}.backup`,
         ),
         markerPath,
+        gitMetadataPaths:
+          parsed.version === 2 ? parsed.gitMetadataPaths : [],
+        markerVersion: parsed.version,
       };
       const run = database.runs.find(
         (candidate) =>
@@ -717,6 +1046,18 @@ export class RunVaultWorkspaceManager {
     ) {
       throw new Error("Promotion paths are outside the managed workspace root");
     }
+    if (
+      promotion.gitMetadataPaths.length > MAX_GIT_METADATA_PATHS ||
+      promotion.gitMetadataPaths.some((relativePath) =>
+        !isValidGitMetadataPath(relativePath),
+      ) ||
+      new Set(promotion.gitMetadataPaths).size !== promotion.gitMetadataPaths.length
+    ) {
+      throw new Error("Promotion contains invalid Git metadata paths");
+    }
+    if (promotion.markerVersion !== 1 && promotion.markerVersion !== 2) {
+      throw new Error("Promotion contains an invalid marker version");
+    }
   }
 
   private async writePromotionMarker(
@@ -724,11 +1065,12 @@ export class RunVaultWorkspaceManager {
     phase: PromotionPhase,
   ): Promise<void> {
     await this.validatePromotion(promotion);
-    const marker: PromotionMarker = {
-      version: 1,
+    const marker: PromotionMarkerV2 = {
+      version: 2,
       runId: promotion.id,
       agentId: promotion.agentId,
       phase,
+      gitMetadataPaths: promotion.gitMetadataPaths,
     };
     const temporaryPath = promotion.markerPath + ".tmp";
     await writeFile(temporaryPath, JSON.stringify(marker) + "\n", {
@@ -762,6 +1104,14 @@ export class RunVaultWorkspaceManager {
       throw new Error("RunVault found conflicting trusted and staging workspaces");
     }
     if (trustedExists) {
+      if (promotion.markerVersion === 2) {
+        await assertGitMetadataInventory(promotion);
+        await moveGitMetadataPaths(
+          promotion.trustedWorkspacePath,
+          promotion.backupWorkspacePath,
+          promotion.gitMetadataPaths,
+        );
+      }
       await rename(promotion.trustedWorkspacePath, promotion.stagingWorkspacePath);
     }
     await rename(promotion.backupWorkspacePath, promotion.trustedWorkspacePath);
@@ -785,6 +1135,16 @@ export class RunVaultWorkspaceManager {
       await rename(promotion.stagingWorkspacePath, promotion.trustedWorkspacePath);
     } else if (!trustedExists) {
       throw new Error("RunVault cannot recover the committed workspace");
+    }
+
+    if (promotion.markerVersion === 2) {
+      await assertGitMetadataInventory(promotion);
+      await moveGitMetadataPaths(
+        promotion.backupWorkspacePath,
+        promotion.trustedWorkspacePath,
+        promotion.gitMetadataPaths,
+      );
+      await assertGitMetadataInventory(promotion);
     }
 
     await rm(promotion.backupWorkspacePath, { recursive: true, force: true });

@@ -27,6 +27,8 @@ Volcengine ECS.
 ## Features
 
 - Transactional staging for every Agent Run
+- Trusted Git metadata excluded from staging and hashing, then preserved across
+  promotion and recovery
 - Deterministic promote, quarantine, and discard policy
 - Explicit verification status, with configured tests run in a no-network,
   resource-limited verification container

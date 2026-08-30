@@ -145,6 +145,38 @@ describe("Agent lifecycle", () => {
     });
   });
 
+  it("preserves trusted Git metadata across an automatically promoted Run", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "source.ts"), "promoted\n");
+        return {
+          output: "Updated source",
+          threadId: "git-preserving-thread",
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Repository builder" });
+    await mkdir(path.join(agent.workspacePath, ".git"));
+    await writeFile(
+      path.join(agent.workspacePath, ".git", "config"),
+      "[core]\nrepositoryformatversion = 0\n",
+    );
+
+    const { run } = await service.sendMessage(agent.id, "update source");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault?.outcome).toBe("promoted");
+    await expect(
+      readFile(path.join(agent.workspacePath, ".git", "config"), "utf8"),
+    ).resolves.toContain("repositoryformatversion");
+    await expect(
+      readFile(path.join(agent.workspacePath, "source.ts"), "utf8"),
+    ).resolves.toBe("promoted\n");
+  });
+
   it("includes verifier-created source changes in final inspection", async () => {
     const verifier = new RunVaultVerifier({
       runner: {
@@ -644,6 +676,39 @@ describe("Agent lifecycle", () => {
       service.getMessages(agent.id).filter((message) => message.role === "assistant"),
     ).toHaveLength(1);
     await expect(service.discardRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("never approves Agent-created Git metadata", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await mkdir(path.join(request.workspacePath, ".git"));
+        return {
+          output: "Created repository metadata",
+          threadId: "git-metadata-thread",
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Metadata builder" });
+    const { run } = await service.sendMessage(agent.id, "initialize git");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "protected_path",
+      changedFiles: {
+        files: [{ path: ".git", kind: "added", protected: true }],
+      },
+    });
+    await expect(service.approveRun(run.id)).rejects.toMatchObject({
+      statusCode: 409,
+      message:
+        "Agent-created Git metadata cannot be approved; request a revision that removes it",
+    });
+    await expect(lstat(path.join(agent.workspacePath, ".git"))).rejects
+      .toMatchObject({ code: "ENOENT" });
   });
 
   it("creates an independently inspected child revision from retained work", async () => {
