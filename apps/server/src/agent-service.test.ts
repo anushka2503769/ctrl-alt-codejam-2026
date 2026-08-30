@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
 import { RunCancelledError, RunTimedOutError } from "./errors.js";
+import { RunVaultVerifier } from "./runvault-verifier.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import {
@@ -78,6 +79,7 @@ async function makeServiceHarness(
   runner: AgentRunner = new FakeRunner(),
   createRunVaultWorkspaces: (workspaceRoot: string) => RunVaultWorkspaceManager =
     (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
+  verifier?: RunVaultVerifier,
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
@@ -89,6 +91,7 @@ async function makeServiceHarness(
     CODEX_HOME: path.join(root, "codex"),
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
+    VERIFICATION_PROVIDER: "host",
   });
   const store = new JsonStore(path.join(root, "data", "db.json"));
   const workspaces = new WorkspaceManager(workspaceRoot);
@@ -99,6 +102,7 @@ async function makeServiceHarness(
     workspaces,
     runner,
     runVaultWorkspaces,
+    verifier,
   );
   await service.initialize();
   return { config, root, runVaultWorkspaces, service, store };
@@ -139,6 +143,50 @@ describe("Agent lifecycle", () => {
       outcome: "promoted",
       reason: "verified_safe",
     });
+  });
+
+  it("includes verifier-created source changes in final inspection", async () => {
+    const verifier = new RunVaultVerifier({
+      runner: {
+        run: async (workspacePath) => {
+          await writeFile(
+            path.join(workspacePath, "verification-generated.ts"),
+            "export const verified = true;\n",
+          );
+          return {
+            status: "passed",
+            command: "npm test",
+            redactedSummary: "Tests passed.",
+            exitCode: 0,
+            timedOut: false,
+          };
+        },
+      },
+    });
+    const harness = await makeServiceHarness(
+      new FakeRunner(),
+      (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
+      verifier,
+    );
+    const agent = await harness.service.createAgent({ name: "Verifier writer" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test" } }),
+    );
+
+    const { run } = await harness.service.sendMessage(agent.id, "verify source");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    expect(harness.service.getRun(run.id).runVault).toMatchObject({
+      outcome: "promoted",
+      changedFiles: {
+        addedCount: 1,
+        files: [{ path: "verification-generated.ts", kind: "added" }],
+      },
+    });
+    await expect(
+      readFile(path.join(agent.workspacePath, "verification-generated.ts"), "utf8"),
+    ).resolves.toBe("export const verified = true;\n");
   });
 
   it("forks only from the last promoted thread after a discarded Run", async () => {

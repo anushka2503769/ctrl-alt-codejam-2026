@@ -15,6 +15,7 @@ import {
   validateReviewPath,
 } from "./runvault-review.js";
 import { RunVaultVerifier } from "./runvault-verifier.js";
+import { createVerifier } from "./verifier-factory.js";
 import {
   RunVaultWorkspaceManager,
   TrustedWorkspaceChangedError,
@@ -77,7 +78,7 @@ export class AgentService {
     private readonly runVaultWorkspaces = new RunVaultWorkspaceManager(
       config.workspaceRoot,
     ),
-    private readonly verifier = new RunVaultVerifier(),
+    private readonly verifier = createVerifier(config),
   ) {}
 
   async initialize(): Promise<void> {
@@ -873,12 +874,6 @@ export class AgentService {
         }
       }
 
-      await this.persistCompletedRun(
-        agentAtStart,
-        run,
-        runnerResult,
-        decision,
-      );
       if (decision.outcome === "discarded") {
         await this.runVaultWorkspaces
           .discardStagingWorkspace(staging.id)
@@ -888,6 +883,12 @@ export class AgentService {
           .discardStagingWorkspace(revision.sourceStagingId)
           .catch(() => undefined);
       }
+      await this.persistCompletedRun(
+        agentAtStart,
+        run,
+        runnerResult,
+        decision,
+      );
     } catch (error) {
       if (promotionCommitted) {
         await this.publishCommittedPromotion(agentAtStart.id, run.id).catch(
@@ -952,6 +953,11 @@ export class AgentService {
         trustedWorkspaceChanged,
         decidedAt: completedAt,
       };
+      if (staging) {
+        await this.runVaultWorkspaces
+          .discardStagingWorkspace(staging.id)
+          .catch(() => undefined);
+      }
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
@@ -971,11 +977,6 @@ export class AgentService {
           agent.updatedAt = completedAt;
         }
       });
-      if (staging) {
-        await this.runVaultWorkspaces
-          .discardStagingWorkspace(staging.id)
-          .catch(() => undefined);
-      }
     }
   }
 

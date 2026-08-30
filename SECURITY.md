@@ -15,8 +15,12 @@ credentials, personal data, or exploit details in an issue.
 - No CSRF protection
 - No per-Agent container boundary in ECS mode
 - Ordinary local containers, not hardened multi-tenant sandboxes
-- Repository `npm test` scripts execute code inside the POC Runtime trust
-  boundary; environment scrubbing and output redaction are not a security sandbox.
+- Docker Compose gives the control-plane container access to the host Docker
+  socket. Verification containers never receive that socket or the trusted
+  workspace, but compromise of the control plane remains host-significant.
+- Repository `npm test` scripts execute in a disposable no-network container
+  with dropped capabilities and resource limits. Ordinary containers are still
+  not a hardened multi-tenant sandbox.
 - Broad outbound network access
 - Prompt-triggered command and file execution
 - Ark key available to the server and active Runtime container

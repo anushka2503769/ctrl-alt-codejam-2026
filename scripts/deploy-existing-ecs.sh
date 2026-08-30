@@ -27,6 +27,14 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
+docker_socket="/var/run/docker.sock"
+if [[ ! -S "$docker_socket" ]]; then
+  echo "Docker socket $docker_socket is required for isolated verification." >&2
+  exit 1
+fi
+export CONTAINER_ENGINE_BINARY="$(command -v docker)"
+export DOCKER_GID="$(stat -c '%g' "$docker_socket")"
+
 mkdir -p data workspaces codex-home
 if [[ "$(stat -c '%u:%g' data)" != "1000:1000" ]] \
   || [[ "$(stat -c '%u:%g' workspaces)" != "1000:1000" ]] \

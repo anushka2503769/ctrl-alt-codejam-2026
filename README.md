@@ -28,7 +28,8 @@ Volcengine ECS.
 
 - Transactional staging for every Agent Run
 - Deterministic promote, quarantine, and discard policy
-- Explicit verification status, with `npm test` run when configured
+- Explicit verification status, with configured tests run in a no-network,
+  resource-limited verification container
 - Focused Run review with findings, file classifications, and safe bounded diffs
 - Revision Runs that continue quarantined proposals without approving the parent
 - Redacted Run evidence with protected-path metadata
@@ -170,8 +171,12 @@ APP_AUTH_TOKEN=replace-with-at-least-24-random-characters
 Start the application:
 
 ```bash
-docker compose up --build
+CONTAINER_ENGINE_BINARY="$(command -v docker)" docker compose up --build
 ```
+
+Compose builds the pinned local verification Runtime before starting the app
+and gives only the control plane access to the host engine. Run containers use
+`--pull never`, so starting a Run never downloads an image.
 
 Open <http://localhost:3000>. Stop it without deleting Agent data:
 
@@ -229,6 +234,9 @@ cp deploy/volcengine/terraform.tfvars.example \
 | `ARK_BASE_URL` | Beijing v3 endpoint | Ark OpenAI-compatible API URL. |
 | `APP_AUTH_TOKEN` | Empty on loopback | Shared demo token; use 24+ random characters remotely. |
 | `RUNTIME_PROVIDER` | `local-process` | `container` for disposable local Runtime containers. |
+| `VERIFICATION_PROVIDER` | `container` | `host` is an explicit development/test-only fallback and is rejected in production. |
+| `VERIFICATION_WORKSPACE_HOST_ROOT` | Workspace root | Host-side workspace path when the server runs inside a container. |
+| `CONTAINER_RUNTIME_IMAGE` | `volc-agent-runtime:local` | Prebuilt image used for Agent and verification containers. |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | Codex inner sandbox mode. |
 | `CODEX_TIMEOUT_MS` | `600000` | Maximum duration of one turn. |
 | `LOCAL_POC_DATA_ROOT` | Platform-specific | Local metadata, workspace, and session directory. |

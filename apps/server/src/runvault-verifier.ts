@@ -21,6 +21,21 @@ export interface RunVaultVerifierOptions {
   maxOutputBytes?: number;
   npmCommand?: string;
   sourceEnvironment?: NodeJS.ProcessEnv;
+  runner?: RunVaultVerificationRunner;
+}
+
+export interface RunVaultVerificationRunnerOptions {
+  timeoutMs: number;
+  maxOutputBytes: number;
+  sourceEnvironment: NodeJS.ProcessEnv;
+}
+
+export interface RunVaultVerificationRunner {
+  run(
+    workspacePath: string,
+    options: RunVaultVerificationRunnerOptions,
+    signal?: AbortSignal,
+  ): Promise<RunVaultVerificationResult>;
 }
 
 class BoundedOutput {
@@ -143,6 +158,7 @@ export class RunVaultVerifier {
   private readonly maxOutputBytes: number;
   private readonly npmCommand: string;
   private readonly sourceEnvironment: NodeJS.ProcessEnv;
+  private readonly runner: RunVaultVerificationRunner | null;
 
   constructor(options: RunVaultVerifierOptions = {}) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_VERIFICATION_TIMEOUT_MS;
@@ -151,6 +167,7 @@ export class RunVaultVerifier {
     this.npmCommand =
       options.npmCommand ?? (process.platform === "win32" ? "npm.cmd" : "npm");
     this.sourceEnvironment = options.sourceEnvironment ?? process.env;
+    this.runner = options.runner ?? null;
     if (!Number.isInteger(this.timeoutMs) || this.timeoutMs <= 0) {
       throw new Error("Verification timeout must be a positive integer");
     }
@@ -209,7 +226,17 @@ export class RunVaultVerifier {
       };
     }
 
-    return this.runNpmTest(workspacePath, signal);
+    return this.runner
+      ? this.runner.run(
+          workspacePath,
+          {
+            timeoutMs: this.timeoutMs,
+            maxOutputBytes: this.maxOutputBytes,
+            sourceEnvironment: this.sourceEnvironment,
+          },
+          signal,
+        )
+      : this.runNpmTest(workspacePath, signal);
   }
 
   private async runNpmTest(

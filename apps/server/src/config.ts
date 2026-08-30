@@ -16,6 +16,8 @@ const envSchema = z.object({
   CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(600_000),
   CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(2_097_152),
   RUNTIME_PROVIDER: z.enum(["local-process", "container"]).default("local-process"),
+  VERIFICATION_PROVIDER: z.enum(["container", "host"]).default("container"),
+  VERIFICATION_WORKSPACE_HOST_ROOT: z.string().optional(),
   CONTAINER_ENGINE: z.string().min(1).default("docker"),
   CONTAINER_RUNTIME_IMAGE: z.string().min(1).default("volc-agent-runtime:local"),
   CONTAINER_CPU_LIMIT: z.coerce.number().positive().default(2),
@@ -51,6 +53,9 @@ export type AppConfig = ReturnType<typeof loadConfig>;
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const env = envSchema.parse(environment);
+  if (env.NODE_ENV === "production" && env.VERIFICATION_PROVIDER === "host") {
+    throw new Error("Host verification is not allowed in production");
+  }
   const authToken = env.APP_AUTH_TOKEN?.trim() ?? "";
   const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
   if (env.NODE_ENV === "production" && !loopbackHosts.has(env.HOST)) {
@@ -64,18 +69,23 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     typeof process.getuid === "function" && typeof process.getgid === "function"
       ? process.getuid() + ":" + process.getgid()
       : "1000:1000";
+  const workspaceRoot = path.resolve(env.AGENT_WORKSPACE_ROOT);
   return {
     host: env.HOST,
     port: env.PORT,
     logLevel: env.LOG_LEVEL,
     dataDirectory: path.resolve(env.APP_DATA_DIR),
-    workspaceRoot: path.resolve(env.AGENT_WORKSPACE_ROOT),
+    workspaceRoot,
     codexHome: path.resolve(env.CODEX_HOME),
     codexBin: env.CODEX_BIN,
     codexSandboxMode: env.CODEX_SANDBOX_MODE,
     codexTimeoutMs: env.CODEX_TIMEOUT_MS,
     codexMaxOutputBytes: env.CODEX_MAX_OUTPUT_BYTES,
     runtimeProvider: env.RUNTIME_PROVIDER,
+    verificationProvider: env.VERIFICATION_PROVIDER,
+    verificationWorkspaceHostRoot: path.resolve(
+      env.VERIFICATION_WORKSPACE_HOST_ROOT?.trim() || workspaceRoot,
+    ),
     containerEngine: env.CONTAINER_ENGINE,
     containerRuntimeImage: env.CONTAINER_RUNTIME_IMAGE,
     containerCpuLimit: env.CONTAINER_CPU_LIMIT,

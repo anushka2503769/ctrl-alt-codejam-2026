@@ -74,8 +74,13 @@ installation during a Run. The trade-off is additional copy time and disk use;
 the POC favors repeatable verification over snapshot speed.
 
 New symbolic links are quarantined before verification. Verification invokes
-only the configured `npm test` command, with a scrubbed environment, bounded
-output, and a timeout. Test output stored in Run evidence is redacted.
+only the configured `npm test` command in a disposable no-network Runtime
+container with a scrubbed environment, dropped capabilities, resource limits,
+bounded output, and a timeout. Test output stored in Run evidence is redacted.
+Only a validated `.staging/<run-id>` source may be bind-mounted. In Docker
+Compose, the control plane translates its container workspace path to the
+host-side workspace root; the verification container never receives the
+trusted workspace, Codex home, credentials, or Docker socket.
 
 ### Storage
 
