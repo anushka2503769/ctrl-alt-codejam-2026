@@ -28,7 +28,7 @@ RUN if [ -n "$DEBIAN_SECURITY_MIRROR" ]; then \
     fi \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git ripgrep \
-    && npm install --global @openai/codex@0.111.0 \
+    && npm install --global @openai/codex@0.150.1 \
     && codex --version \
     && rm -rf /var/lib/apt/lists/*
 

@@ -1,0 +1,701 @@
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readlink,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import path from "node:path";
+import type { Database, RunVaultFileChange } from "./types.js";
+
+const RESERVED_DIRECTORY_NAMES = new Set([".codex", ".staging"]);
+const BINARY_EXTENSIONS = new Set([
+  ".class",
+  ".dll",
+  ".dylib",
+  ".exe",
+  ".gif",
+  ".gz",
+  ".ico",
+  ".jar",
+  ".jpeg",
+  ".jpg",
+  ".mov",
+  ".mp3",
+  ".mp4",
+  ".pdf",
+  ".png",
+  ".pyc",
+  ".so",
+  ".tar",
+  ".wasm",
+  ".webp",
+  ".zip",
+]);
+const DEPENDENCY_FILE_NAMES = new Set([
+  "bun.lock",
+  "bun.lockb",
+  "composer.json",
+  "composer.lock",
+  "deno.json",
+  "deno.jsonc",
+  "deno.lock",
+  "gemfile",
+  "gemfile.lock",
+  "go.mod",
+  "go.sum",
+  "package-lock.json",
+  "package.json",
+  "pnpm-lock.yaml",
+  "poetry.lock",
+  "pyproject.toml",
+  "requirements.txt",
+  "uv.lock",
+  "yarn.lock",
+]);
+
+type WorkspaceEntryType = "directory" | "file" | "symbolic-link";
+
+export interface WorkspaceEntrySnapshot {
+  path: string;
+  type: WorkspaceEntryType;
+  digest: string;
+  mode: number;
+  binary: boolean;
+}
+
+export interface WorkspaceSnapshot {
+  fingerprint: string;
+  entries: WorkspaceEntrySnapshot[];
+}
+
+export interface StagingWorkspace {
+  id: string;
+  path: string;
+  trustedSnapshot: WorkspaceSnapshot;
+}
+
+export interface RunVaultWorkspaceInspection {
+  changes: RunVaultFileChange[];
+  stagingFingerprint: string;
+}
+
+export interface RunVaultPromotion {
+  id: string;
+  agentId: string;
+  trustedWorkspacePath: string;
+  stagingWorkspacePath: string;
+  backupWorkspacePath: string;
+  markerPath: string;
+}
+
+type PromotionPhase = "prepared" | "installed" | "committed";
+
+interface PromotionMarker {
+  version: 1;
+  runId: string;
+  agentId: string;
+  phase: PromotionPhase;
+}
+
+export class UnsafeWorkspaceEntryError extends Error {}
+export class TrustedWorkspaceChangedError extends Error {}
+
+function isInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith(".." + path.sep) && relative !== "..");
+}
+
+function validateWorkspaceId(id: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+    throw new Error("Invalid staging workspace ID");
+  }
+}
+
+async function pathExists(candidate: string): Promise<boolean> {
+  try {
+    await lstat(candidate);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function isPromotionMarker(value: unknown): value is PromotionMarker {
+  if (!value || typeof value !== "object") return false;
+  const marker = value as Partial<PromotionMarker>;
+  return (
+    marker.version === 1 &&
+    typeof marker.runId === "string" &&
+    typeof marker.agentId === "string" &&
+    (marker.phase === "prepared" ||
+      marker.phase === "installed" ||
+      marker.phase === "committed")
+  );
+}
+
+function toRelativePath(root: string, absolutePath: string): string {
+  return path.relative(root, absolutePath).split(path.sep).join("/");
+}
+
+function shouldExclude(relativePath: string): boolean {
+  return relativePath
+    .split("/")
+    .some((segment) => RESERVED_DIRECTORY_NAMES.has(segment));
+}
+
+export function isProtectedRunVaultPath(relativePath: string): boolean {
+  const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\//, "");
+  return (
+    normalized === ".env" ||
+    normalized.startsWith(".env.") ||
+    normalized === ".codex" ||
+    normalized.startsWith(".codex/") ||
+    normalized === ".staging" ||
+    normalized.startsWith(".staging/") ||
+    normalized === "AGENTS.md" ||
+    normalized === ".github/workflows" ||
+    normalized.startsWith(".github/workflows/") ||
+    normalized === "infra" ||
+    normalized.startsWith("infra/") ||
+    normalized === "deploy" ||
+    normalized.startsWith("deploy/")
+  );
+}
+
+export function isDependencyFile(relativePath: string): boolean {
+  const normalized = relativePath.replaceAll("\\", "/");
+  const basename = path.posix.basename(normalized).toLowerCase();
+  return (
+    DEPENDENCY_FILE_NAMES.has(basename) ||
+    /^requirements(?:[._-].+)?\.txt$/.test(basename)
+  );
+}
+
+function isKnownBinaryPath(relativePath: string): boolean {
+  return BINARY_EXTENSIONS.has(path.posix.extname(relativePath).toLowerCase());
+}
+
+async function hashFile(
+  filePath: string,
+  relativePath: string,
+): Promise<{ digest: string; binary: boolean }> {
+  const hash = createHash("sha256");
+  const sampleChunks: Buffer[] = [];
+  let sampleBytes = 0;
+
+  for await (const rawChunk of createReadStream(filePath)) {
+    const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+    hash.update(chunk);
+    if (sampleBytes < 8_192) {
+      const sample = chunk.subarray(0, 8_192 - sampleBytes);
+      sampleChunks.push(sample);
+      sampleBytes += sample.length;
+    }
+  }
+
+  const sample = Buffer.concat(sampleChunks);
+  let invalidUtf8 = false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(sample);
+  } catch {
+    invalidUtf8 = true;
+  }
+
+  return {
+    digest: hash.digest("hex"),
+    binary:
+      isKnownBinaryPath(relativePath) || sample.includes(0) || invalidUtf8,
+  };
+}
+
+async function collectEntries(
+  root: string,
+  current: string,
+  entries: WorkspaceEntrySnapshot[],
+  excludeReservedDirectories: boolean,
+): Promise<void> {
+  const children = await readdir(current, { withFileTypes: true });
+  children.sort((left, right) => left.name.localeCompare(right.name));
+
+  for (const child of children) {
+    const absolutePath = path.join(current, child.name);
+    const relativePath = toRelativePath(root, absolutePath);
+    if (excludeReservedDirectories && shouldExclude(relativePath)) continue;
+
+    const stats = await lstat(absolutePath);
+    if (stats.isDirectory()) {
+      entries.push({
+        path: relativePath,
+        type: "directory",
+        digest: "",
+        mode: stats.mode & 0o777,
+        binary: false,
+      });
+      await collectEntries(
+        root,
+        absolutePath,
+        entries,
+        excludeReservedDirectories,
+      );
+      continue;
+    }
+    if (stats.isFile()) {
+      const { digest, binary } = await hashFile(absolutePath, relativePath);
+      entries.push({
+        path: relativePath,
+        type: "file",
+        digest,
+        mode: stats.mode & 0o777,
+        binary,
+      });
+      continue;
+    }
+    if (stats.isSymbolicLink()) {
+      const target = await readlink(absolutePath);
+      entries.push({
+        path: relativePath,
+        type: "symbolic-link",
+        digest: createHash("sha256").update(target).digest("hex"),
+        mode: stats.mode & 0o777,
+        binary: false,
+      });
+      continue;
+    }
+
+    throw new UnsafeWorkspaceEntryError(
+      `Unsupported workspace entry type at ${relativePath}`,
+    );
+  }
+}
+
+function fingerprintEntries(entries: WorkspaceEntrySnapshot[]): string {
+  const hash = createHash("sha256");
+  for (const entry of entries) {
+    hash.update(entry.path);
+    hash.update("\0");
+    hash.update(entry.type);
+    hash.update("\0");
+    hash.update(entry.digest);
+    hash.update("\0");
+    hash.update(String(entry.mode));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+async function copyWorkspaceEntry(
+  trustedRoot: string,
+  stagingRoot: string,
+  sourcePath: string,
+): Promise<void> {
+  const children = await readdir(sourcePath, { withFileTypes: true });
+  children.sort((left, right) => left.name.localeCompare(right.name));
+
+  for (const child of children) {
+    const source = path.join(sourcePath, child.name);
+    const relativePath = toRelativePath(trustedRoot, source);
+    if (shouldExclude(relativePath)) continue;
+    const destination = path.join(stagingRoot, ...relativePath.split("/"));
+    const stats = await lstat(source);
+
+    if (stats.isDirectory()) {
+      await mkdir(destination, { mode: stats.mode & 0o777 });
+      await copyWorkspaceEntry(trustedRoot, stagingRoot, source);
+      continue;
+    }
+    if (stats.isFile()) {
+      await copyFile(source, destination);
+      await chmod(destination, stats.mode & 0o777);
+      continue;
+    }
+    if (stats.isSymbolicLink()) {
+      const target = await readlink(source);
+      if (path.isAbsolute(target)) {
+        throw new UnsafeWorkspaceEntryError(
+          `Absolute symbolic link is not allowed at ${relativePath}`,
+        );
+      }
+      const resolvedTarget = path.resolve(path.dirname(source), target);
+      if (!isInside(trustedRoot, resolvedTarget)) {
+        throw new UnsafeWorkspaceEntryError(
+          `Symbolic link escapes the workspace at ${relativePath}`,
+        );
+      }
+      await symlink(target, destination);
+      continue;
+    }
+
+    throw new UnsafeWorkspaceEntryError(
+      `Unsupported workspace entry type at ${relativePath}`,
+    );
+  }
+}
+
+function entriesEqual(
+  left: WorkspaceEntrySnapshot,
+  right: WorkspaceEntrySnapshot,
+): boolean {
+  return (
+    left.type === right.type &&
+    left.digest === right.digest &&
+    left.mode === right.mode
+  );
+}
+
+export class RunVaultWorkspaceManager {
+  private readonly stagingRoot: string;
+
+  constructor(private readonly workspaceRoot: string) {
+    this.workspaceRoot = path.resolve(workspaceRoot);
+    this.stagingRoot = path.join(this.workspaceRoot, ".staging");
+  }
+
+  async initialize(): Promise<void> {
+    await mkdir(this.stagingRoot, { recursive: true });
+  }
+
+  stagingPath(id: string): string {
+    validateWorkspaceId(id);
+    return path.join(this.stagingRoot, id);
+  }
+
+  promotionMarkerPath(id: string): string {
+    validateWorkspaceId(id);
+    return path.join(this.stagingRoot, `${id}.promotion.json`);
+  }
+
+  async snapshotWorkspace(workspacePath: string): Promise<WorkspaceSnapshot> {
+    const resolvedPath = path.resolve(workspacePath);
+    if (!isInside(this.workspaceRoot, resolvedPath) || resolvedPath === this.workspaceRoot) {
+      throw new Error("Workspace path is outside the managed workspace root");
+    }
+    const entries: WorkspaceEntrySnapshot[] = [];
+    await collectEntries(
+      resolvedPath,
+      resolvedPath,
+      entries,
+      !isInside(this.stagingRoot, resolvedPath),
+    );
+    return { entries, fingerprint: fingerprintEntries(entries) };
+  }
+
+  async createStagingWorkspace(
+    id: string,
+    trustedWorkspacePath: string,
+  ): Promise<StagingWorkspace> {
+    const stagingPath = this.stagingPath(id);
+    const trustedPath = path.resolve(trustedWorkspacePath);
+    if (
+      !isInside(this.workspaceRoot, trustedPath) ||
+      trustedPath === this.workspaceRoot ||
+      isInside(this.stagingRoot, trustedPath)
+    ) {
+      throw new Error("Trusted workspace path is outside the managed workspace root");
+    }
+
+    const trustedSnapshot = await this.snapshotWorkspace(trustedPath);
+    await mkdir(stagingPath, { recursive: false });
+    try {
+      await copyWorkspaceEntry(trustedPath, stagingPath, trustedPath);
+      const afterCopy = await this.snapshotWorkspace(trustedPath);
+      if (afterCopy.fingerprint !== trustedSnapshot.fingerprint) {
+        throw new Error("Trusted workspace changed while staging was created");
+      }
+      return { id, path: stagingPath, trustedSnapshot };
+    } catch (error) {
+      await rm(stagingPath, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  async inspectChanges(
+    baseline: WorkspaceSnapshot,
+    stagingWorkspacePath: string,
+  ): Promise<RunVaultWorkspaceInspection> {
+    const stagingPath = path.resolve(stagingWorkspacePath);
+    if (!isInside(this.stagingRoot, stagingPath) || stagingPath === this.stagingRoot) {
+      throw new Error("Staging workspace path is outside the staging root");
+    }
+
+    const stagingSnapshot = await this.snapshotWorkspace(stagingPath);
+    const baselineByPath = new Map(baseline.entries.map((entry) => [entry.path, entry]));
+    const stagingByPath = new Map(
+      stagingSnapshot.entries.map((entry) => [entry.path, entry]),
+    );
+    const paths = [...new Set([...baselineByPath.keys(), ...stagingByPath.keys()])].sort();
+    const changes: RunVaultFileChange[] = [];
+
+    for (const relativePath of paths) {
+      const before = baselineByPath.get(relativePath);
+      const after = stagingByPath.get(relativePath);
+      if (before?.type === "directory" && after?.type === "directory") continue;
+      if (before && after && entriesEqual(before, after)) continue;
+      if (!before && after?.type === "directory") continue;
+      if (before?.type === "directory" && !after) continue;
+
+      const kind = !before ? "added" : !after ? "deleted" : "modified";
+      const becameExecutable =
+        after?.type === "file" &&
+        (after.mode & 0o111) !== 0 &&
+        (before?.type !== "file" || (before.mode & 0o111) === 0);
+      const becameBinary =
+        after?.type === "file" &&
+        after.binary &&
+        (before?.type !== "file" || !before.binary);
+      const introducedSymbolicLink =
+        after?.type === "symbolic-link" &&
+        (before?.type !== "symbolic-link" || before.digest !== after.digest);
+
+      changes.push({
+        path: relativePath,
+        kind,
+        protected: isProtectedRunVaultPath(relativePath),
+        dependencyFile: isDependencyFile(relativePath),
+        executable: becameExecutable,
+        binary: becameBinary,
+        symbolicLink: introducedSymbolicLink,
+      });
+    }
+
+    return { changes, stagingFingerprint: stagingSnapshot.fingerprint };
+  }
+
+  async discardStagingWorkspace(id: string): Promise<void> {
+    await rm(this.stagingPath(id), { recursive: true, force: true });
+  }
+
+  async beginPromotion(
+    id: string,
+    trustedWorkspacePath: string,
+    expectedTrustedFingerprint: string,
+  ): Promise<RunVaultPromotion> {
+    const stagingWorkspacePath = this.stagingPath(id);
+    const trustedPath = path.resolve(trustedWorkspacePath);
+    if (path.dirname(trustedPath) !== this.workspaceRoot) {
+      throw new Error("Trusted workspace path is outside the managed workspace root");
+    }
+    const agentId = path.basename(trustedPath);
+    validateWorkspaceId(agentId);
+    const current = await this.snapshotWorkspace(trustedPath);
+    if (current.fingerprint !== expectedTrustedFingerprint) {
+      throw new TrustedWorkspaceChangedError(
+        "Trusted workspace changed before promotion",
+      );
+    }
+
+    const backupWorkspacePath = path.join(this.stagingRoot, `${id}.backup`);
+    const markerPath = this.promotionMarkerPath(id);
+    const promotion: RunVaultPromotion = {
+      id,
+      agentId,
+      trustedWorkspacePath: trustedPath,
+      stagingWorkspacePath,
+      backupWorkspacePath,
+      markerPath,
+    };
+    await this.writePromotionMarker(promotion, "prepared");
+    try {
+      await rename(trustedPath, backupWorkspacePath);
+      await rename(stagingWorkspacePath, trustedPath);
+      await this.writePromotionMarker(promotion, "installed");
+    } catch (error) {
+      await this.restorePrePromotionState(promotion);
+      await rm(markerPath, { force: true });
+      throw error;
+    }
+    return promotion;
+  }
+
+  async rollbackPromotion(promotion: RunVaultPromotion): Promise<void> {
+    await this.validatePromotion(promotion);
+    await this.restorePrePromotionState(promotion);
+    await rm(promotion.markerPath, { force: true });
+  }
+
+  async finalizePromotion(promotion: RunVaultPromotion): Promise<void> {
+    await this.validatePromotion(promotion);
+    await this.writePromotionMarker(promotion, "committed");
+    await rm(promotion.backupWorkspacePath, { recursive: true, force: true });
+    await rm(promotion.markerPath, { force: true });
+  }
+
+  async reconcileTransactions(database: Database): Promise<void> {
+    await this.initialize();
+    const entries = await readdir(this.stagingRoot, { withFileTypes: true });
+    const markerNames = entries
+      .filter(
+        (entry) =>
+          entry.isFile() && entry.name.endsWith(".promotion.json"),
+      )
+      .map((entry) => entry.name)
+      .sort();
+
+    for (const markerName of markerNames) {
+      const markerPath = path.join(this.stagingRoot, markerName);
+      const parsed = JSON.parse(await readFile(markerPath, "utf8")) as unknown;
+      if (!isPromotionMarker(parsed)) {
+        throw new Error(`Invalid RunVault promotion marker: ${markerName}`);
+      }
+      validateWorkspaceId(parsed.runId);
+      validateWorkspaceId(parsed.agentId);
+      if (markerName !== `${parsed.runId}.promotion.json`) {
+        throw new Error(`RunVault promotion marker name does not match its Run`);
+      }
+      const trustedWorkspacePath = path.join(this.workspaceRoot, parsed.agentId);
+      const promotion: RunVaultPromotion = {
+        id: parsed.runId,
+        agentId: parsed.agentId,
+        trustedWorkspacePath,
+        stagingWorkspacePath: this.stagingPath(parsed.runId),
+        backupWorkspacePath: path.join(
+          this.stagingRoot,
+          `${parsed.runId}.backup`,
+        ),
+        markerPath,
+      };
+      const run = database.runs.find(
+        (candidate) =>
+          candidate.id === parsed.runId && candidate.agentId === parsed.agentId,
+      );
+      const agent = database.agents.find(
+        (candidate) => candidate.id === parsed.agentId,
+      );
+      if (!run || !agent || path.resolve(agent.workspacePath) !== trustedWorkspacePath) {
+        throw new Error(
+          `RunVault cannot reconcile promotion ${parsed.runId}: persisted Run or Agent is missing`,
+        );
+      }
+
+      if (run.runVault?.outcome === "promoted") {
+        await this.finishCommittedPromotion(promotion);
+      } else {
+        await this.restorePrePromotionState(promotion);
+        if (run.runVault?.outcome !== "quarantined") {
+          await this.discardStagingWorkspace(parsed.runId);
+        }
+        await rm(markerPath, { force: true });
+      }
+    }
+
+    const retainedStagingIds = new Set(
+      database.runs.flatMap((run) =>
+        run.runVault?.outcome === "quarantined" &&
+        run.runVault.stagingWorkspaceId
+          ? [run.runVault.stagingWorkspaceId]
+          : [],
+      ),
+    );
+    const remaining = await readdir(this.stagingRoot, { withFileTypes: true });
+    for (const entry of remaining) {
+      if (entry.name.endsWith(".promotion.json.tmp")) {
+        await rm(path.join(this.stagingRoot, entry.name), { force: true });
+        continue;
+      }
+      if (!entry.isDirectory() || entry.name.endsWith(".backup")) continue;
+      if (!retainedStagingIds.has(entry.name)) {
+        await rm(path.join(this.stagingRoot, entry.name), {
+          recursive: true,
+          force: true,
+        });
+      }
+    }
+  }
+
+  private async validatePromotion(promotion: RunVaultPromotion): Promise<void> {
+    validateWorkspaceId(promotion.id);
+    validateWorkspaceId(promotion.agentId);
+    if (
+      path.resolve(promotion.trustedWorkspacePath) !==
+        path.join(this.workspaceRoot, promotion.agentId) ||
+      path.resolve(promotion.stagingWorkspacePath) !== this.stagingPath(promotion.id) ||
+      path.resolve(promotion.backupWorkspacePath) !==
+        path.join(this.stagingRoot, `${promotion.id}.backup`) ||
+      path.resolve(promotion.markerPath) !== this.promotionMarkerPath(promotion.id)
+    ) {
+      throw new Error("Promotion paths are outside the managed workspace root");
+    }
+  }
+
+  private async writePromotionMarker(
+    promotion: RunVaultPromotion,
+    phase: PromotionPhase,
+  ): Promise<void> {
+    await this.validatePromotion(promotion);
+    const marker: PromotionMarker = {
+      version: 1,
+      runId: promotion.id,
+      agentId: promotion.agentId,
+      phase,
+    };
+    const temporaryPath = promotion.markerPath + ".tmp";
+    await writeFile(temporaryPath, JSON.stringify(marker) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    const handle = await open(temporaryPath, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporaryPath, promotion.markerPath);
+  }
+
+  private async restorePrePromotionState(
+    promotion: RunVaultPromotion,
+  ): Promise<void> {
+    await this.validatePromotion(promotion);
+    const trustedExists = await pathExists(promotion.trustedWorkspacePath);
+    const stagingExists = await pathExists(promotion.stagingWorkspacePath);
+    const backupExists = await pathExists(promotion.backupWorkspacePath);
+
+    if (!backupExists) {
+      if (!trustedExists) {
+        throw new Error("RunVault cannot recover the missing trusted workspace");
+      }
+      return;
+    }
+    if (trustedExists && stagingExists) {
+      throw new Error("RunVault found conflicting trusted and staging workspaces");
+    }
+    if (trustedExists) {
+      await rename(promotion.trustedWorkspacePath, promotion.stagingWorkspacePath);
+    }
+    await rename(promotion.backupWorkspacePath, promotion.trustedWorkspacePath);
+  }
+
+  private async finishCommittedPromotion(
+    promotion: RunVaultPromotion,
+  ): Promise<void> {
+    await this.validatePromotion(promotion);
+    const trustedExists = await pathExists(promotion.trustedWorkspacePath);
+    const stagingExists = await pathExists(promotion.stagingWorkspacePath);
+    const backupExists = await pathExists(promotion.backupWorkspacePath);
+
+    if (trustedExists && stagingExists) {
+      if (backupExists) {
+        throw new Error("RunVault found conflicting committed workspaces");
+      }
+      await rename(promotion.trustedWorkspacePath, promotion.backupWorkspacePath);
+      await rename(promotion.stagingWorkspacePath, promotion.trustedWorkspacePath);
+    } else if (!trustedExists && stagingExists) {
+      await rename(promotion.stagingWorkspacePath, promotion.trustedWorkspacePath);
+    } else if (!trustedExists) {
+      throw new Error("RunVault cannot recover the committed workspace");
+    }
+
+    await rm(promotion.backupWorkspacePath, { recursive: true, force: true });
+    await rm(promotion.markerPath, { force: true });
+  }
+}

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
+import { RunVaultPanel, type RunVaultAction } from "./RunVaultPanel";
 import type { Agent, AgentRun, Message, SystemInfo } from "./types";
 
 const starterPrompts = [
@@ -45,11 +46,13 @@ export default function App() {
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
+  const [runVaultAction, setRunVaultAction] = useState<RunVaultAction | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
   const [authInput, setAuthInput] = useState("");
-  const messageEnd = useRef<HTMLDivElement>(null);
+  const messagesContainer = useRef<HTMLDivElement>(null);
+  const runVaultPanelAnchor = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
   const pollingRunIds = useRef(new Set<string>());
@@ -98,6 +101,7 @@ export default function App() {
 
   useEffect(() => {
     setActiveRun(null);
+    setRunVaultAction(null);
     setShowSettings(false);
     if (!selectedId) {
       setMessages([]);
@@ -130,7 +134,23 @@ export default function App() {
   }, [selected]);
 
   useEffect(() => {
-    messageEnd.current?.scrollIntoView({ behavior: "smooth" });
+    const container = messagesContainer.current;
+    const runVaultPanel = runVaultPanelAnchor.current;
+    if (!container) return;
+    if (
+      runVaultPanel &&
+      activeRun?.runVault &&
+      !["queued", "running"].includes(activeRun.status)
+    ) {
+      const containerTop = container.getBoundingClientRect().top;
+      const panelTop = runVaultPanel.getBoundingClientRect().top;
+      container.scrollTo({
+        top: container.scrollTop + panelTop - containerTop - 14,
+        behavior: "smooth",
+      });
+      return;
+    }
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
   }, [messages, activeRun]);
 
   const createAgent = async (event: React.FormEvent) => {
@@ -222,7 +242,7 @@ export default function App() {
 
   const sendMessage = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!selected || !prompt.trim()) return;
+    if (!selected || !prompt.trim() || runVaultAction) return;
     const content = prompt.trim();
     setPrompt("");
     setError(null);
@@ -242,6 +262,37 @@ export default function App() {
       setError(reason instanceof Error ? reason.message : String(reason));
       setActiveRun(null);
       await refreshAgents();
+    }
+  };
+
+  const resolveRunVault = async (action: RunVaultAction) => {
+    if (!activeRun?.runVault || activeRun.runVault.outcome !== "quarantined") {
+      return;
+    }
+    if (
+      action === "discard" &&
+      !window.confirm(
+        "Discard this quarantined workspace? Its staged files cannot be recovered.",
+      )
+    ) {
+      return;
+    }
+    const agentId = activeRun.agentId;
+    setRunVaultAction(action);
+    setError(null);
+    try {
+      const result =
+        action === "approve"
+          ? await api.approveRun(activeRun.id)
+          : await api.discardRun(activeRun.id);
+      if (selectedIdRef.current === agentId) {
+        setActiveRun(result.run);
+      }
+      await Promise.all([refreshMessages(agentId), refreshAgents()]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setRunVaultAction(null);
     }
   };
 
@@ -489,7 +540,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="messages">
+              <div className="messages" ref={messagesContainer}>
                 {messages.length === 0 && !activeRun ? (
                   <div className="welcome">
                     <div className="welcome-orbit">
@@ -538,7 +589,16 @@ export default function App() {
                     <span>{activeRun.error}</span>
                   </article>
                 )}
-                <div ref={messageEnd} />
+                {activeRun?.runVault &&
+                  !["queued", "running"].includes(activeRun.status) && (
+                    <div ref={runVaultPanelAnchor}>
+                      <RunVaultPanel
+                        run={activeRun}
+                        action={runVaultAction}
+                        onAction={(action) => void resolveRunVault(action)}
+                      />
+                    </div>
+                  )}
               </div>
 
               <form className="composer" onSubmit={sendMessage}>
@@ -559,6 +619,7 @@ export default function App() {
                   disabled={
                     selected.status === "stopped" ||
                     selected.status === "busy" ||
+                    runVaultAction !== null ||
                     activeRun != null && ["queued", "running"].includes(activeRun.status)
                   }
                   rows={3}
@@ -573,6 +634,7 @@ export default function App() {
                       !prompt.trim() ||
                       selected.status === "stopped" ||
                       selected.status === "busy" ||
+                      runVaultAction !== null ||
                       (activeRun != null && ["queued", "running"].includes(activeRun.status))
                     }
                     aria-label="Send message"

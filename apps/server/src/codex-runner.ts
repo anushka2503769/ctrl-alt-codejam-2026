@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
-import { RunCancelledError } from "./errors.js";
+import { RunCancelledError, RunTimedOutError } from "./errors.js";
 import type {
   AgentRunner,
   RunUsage,
@@ -34,7 +34,7 @@ export function buildCodexArgs(
     workspacePath,
   ];
   if (request.threadId) {
-    args.push("resume", request.threadId, request.prompt);
+    args.push("fork", request.threadId, request.prompt);
   } else {
     args.push(request.prompt);
   }
@@ -151,7 +151,7 @@ export class CodexRunner implements AgentRunner {
 
     const parsed: ParsedEvents = {
       messages: [],
-      threadId: request.threadId,
+      threadId: null,
       usage: null,
       errors: [],
     };
@@ -202,7 +202,9 @@ export class CodexRunner implements AgentRunner {
         throw new RunCancelledError();
       }
       if (active.timedOut) {
-        throw new Error("Codex timed out after " + this.config.codexTimeoutMs + " ms");
+        throw new RunTimedOutError(
+          "Codex timed out after " + this.config.codexTimeoutMs + " ms",
+        );
       }
       if (active.outputExceeded) {
         throw new Error("Codex output exceeded CODEX_MAX_OUTPUT_BYTES");
@@ -214,6 +216,9 @@ export class CodexRunner implements AgentRunner {
       const output = parsed.messages.at(-1)?.trim();
       if (!output) {
         throw new Error("Codex completed without an agent message");
+      }
+      if (!parsed.threadId) {
+        throw new Error("Codex completed without a provisional thread ID");
       }
       return {
         output,

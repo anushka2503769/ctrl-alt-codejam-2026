@@ -1,7 +1,22 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
-import { HttpError, RunCancelledError } from "./errors.js";
+import {
+  HttpError,
+  RunCancelledError,
+  RunTimedOutError,
+} from "./errors.js";
+import {
+  evaluateRunVaultPolicy,
+  type RunVaultExecutionStatus,
+} from "./runvault-policy.js";
+import { RunVaultVerifier } from "./runvault-verifier.js";
+import {
+  RunVaultWorkspaceManager,
+  TrustedWorkspaceChangedError,
+  type RunVaultPromotion,
+  type StagingWorkspace,
+} from "./runvault-workspace.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
@@ -9,38 +24,122 @@ import type {
   AgentRunner,
   CreateAgentInput,
   Message,
+  RunVaultDecision,
+  RunVaultFileChange,
+  RunVaultVerification,
+  RunnerResult,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
+const skippedVerification = (summary: string): RunVaultVerification => ({
+  status: "skipped",
+  command: null,
+  redactedSummary: summary,
+});
+
+function verificationEvidence(
+  verification: RunVaultVerification,
+): RunVaultVerification {
+  return {
+    status: verification.status,
+    command: verification.command,
+    redactedSummary: verification.redactedSummary,
+  };
+}
+
 export class AgentService {
-  private readonly activeExecutions = new Map<string, Promise<void>>();
+  private readonly activeExecutions = new Map<string, Promise<unknown>>();
   private readonly cancellationRequests = new Set<string>();
+  private readonly verificationControllers = new Map<string, AbortController>();
 
   constructor(
     private readonly config: AppConfig,
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    private readonly runVaultWorkspaces = new RunVaultWorkspaceManager(
+      config.workspaceRoot,
+    ),
+    private readonly verifier = new RunVaultVerifier(),
   ) {}
 
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
+    await this.runVaultWorkspaces.initialize();
     await this.store.mutate((database) => {
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
+          if (run.runVault?.outcome === "promoted") {
+            continue;
+          }
+          const completedAt = now();
           run.status = "cancelled";
           run.error = "Server restarted while this run was active";
-          run.completedAt = now();
+          run.runVault = {
+            outcome: "discarded",
+            reason: "cancelled",
+            resolution: "policy",
+            stagingWorkspaceId: run.runVault?.stagingWorkspaceId ?? run.id,
+            provisionalThreadId: run.runVault?.provisionalThreadId ?? null,
+            trustedWorkspaceFingerprint:
+              run.runVault?.trustedWorkspaceFingerprint ?? null,
+            stagingWorkspaceFingerprint:
+              run.runVault?.stagingWorkspaceFingerprint ?? null,
+            changedFiles: run.runVault?.changedFiles ?? {
+              addedCount: 0,
+              modifiedCount: 0,
+              deletedCount: 0,
+              protectedPathsTouched: [],
+            },
+            verification: skippedVerification(
+              "Verification was interrupted when the server restarted.",
+            ),
+            trustedWorkspaceChanged:
+              run.runVault?.trustedWorkspaceChanged ?? false,
+            decidedAt: completedAt,
+          };
+          run.completedAt = completedAt;
         }
       }
       for (const agent of database.agents) {
-        if (agent.status === "busy") {
+        const hasCommittedPromotion = database.runs.some(
+          (run) =>
+            run.agentId === agent.id &&
+            (run.status === "queued" || run.status === "running") &&
+            run.runVault?.outcome === "promoted",
+        );
+        if (agent.status === "busy" && !hasCommittedPromotion) {
           agent.status = "ready";
           agent.updatedAt = now();
+        }
+      }
+    });
+    await this.runVaultWorkspaces.reconcileTransactions(this.store.snapshot());
+    await this.store.mutate((database) => {
+      const recoveredAt = now();
+      for (const run of database.runs) {
+        if (
+          (run.status === "queued" || run.status === "running") &&
+          run.runVault?.outcome === "promoted"
+        ) {
+          run.status = "completed";
+          run.error = null;
+          run.completedAt = run.completedAt ?? recoveredAt;
+        }
+      }
+      for (const agent of database.agents) {
+        const hasActiveRun = database.runs.some(
+          (run) =>
+            run.agentId === agent.id &&
+            (run.status === "queued" || run.status === "running"),
+        );
+        if (agent.status === "busy" && !hasActiveRun) {
+          agent.status = "ready";
+          agent.updatedAt = recoveredAt;
         }
       }
     });
@@ -107,6 +206,22 @@ export class AgentService {
   async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
     const agent = this.getAgent(id);
     await this.cancelExecution(id);
+    const retainedStagingIds = this.store
+      .snapshot()
+      .runs.filter(
+        (run) =>
+          run.agentId === id && run.runVault?.outcome === "quarantined",
+      )
+      .flatMap((run) =>
+        run.runVault?.stagingWorkspaceId
+          ? [run.runVault.stagingWorkspaceId]
+          : [],
+      );
+    await Promise.all(
+      retainedStagingIds.map((stagingId) =>
+        this.runVaultWorkspaces.discardStagingWorkspace(stagingId),
+      ),
+    );
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
       database.agents = database.agents.filter((item) => item.id !== id);
@@ -150,6 +265,107 @@ export class AgentService {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
+  async approveRun(runId: string): Promise<AgentRun> {
+    const reservation = await this.store.mutate((database) => {
+      const run = database.runs.find((item) => item.id === runId);
+      if (!run) throw new HttpError(404, "Run not found");
+      if (
+        run.runVault?.outcome === "promoted" &&
+        run.runVault.resolution === "human_approved"
+      ) {
+        return { completed: structuredClone(run) } as const;
+      }
+      if (
+        run.runVault?.outcome === "discarded" &&
+        run.runVault.resolution === "human_discarded"
+      ) {
+        throw new HttpError(409, "This quarantined Run was already discarded");
+      }
+      if (run.runVault?.outcome !== "quarantined") {
+        throw new HttpError(409, "Only a quarantined Run can be approved");
+      }
+      const agent = database.agents.find((item) => item.id === run.agentId);
+      if (!agent) throw new HttpError(404, "Agent not found");
+      if (agent.status === "busy") {
+        throw new HttpError(409, "Wait for the active Agent operation to finish");
+      }
+      const decision = run.runVault;
+      if (
+        !decision.stagingWorkspaceId ||
+        !decision.provisionalThreadId ||
+        !decision.trustedWorkspaceFingerprint ||
+        !decision.stagingWorkspaceFingerprint ||
+        !run.output
+      ) {
+        throw new HttpError(
+          409,
+          "This quarantined Run is missing promotion evidence and cannot be approved",
+        );
+      }
+      const previousStatus = agent.status;
+      agent.status = "busy";
+      agent.updatedAt = now();
+      return {
+        run: structuredClone(run),
+        agent: structuredClone(agent),
+        previousStatus,
+      } as const;
+    });
+    if ("completed" in reservation) return reservation.completed;
+
+    const operation = this.promoteQuarantinedRun(
+      reservation.run,
+      reservation.agent,
+      reservation.previousStatus,
+    );
+    this.activeExecutions.set(reservation.agent.id, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.activeExecutions.get(reservation.agent.id) === operation) {
+        this.activeExecutions.delete(reservation.agent.id);
+      }
+    }
+  }
+
+  async discardRun(runId: string): Promise<AgentRun> {
+    const updated = await this.store.mutate((database) => {
+      const run = database.runs.find((item) => item.id === runId);
+      if (!run) throw new HttpError(404, "Run not found");
+      if (
+        run.runVault?.outcome === "discarded" &&
+        run.runVault.resolution === "human_discarded"
+      ) {
+        return structuredClone(run);
+      }
+      if (
+        run.runVault?.outcome === "promoted" &&
+        run.runVault.resolution === "human_approved"
+      ) {
+        throw new HttpError(409, "This quarantined Run was already approved");
+      }
+      if (run.runVault?.outcome !== "quarantined") {
+        throw new HttpError(409, "Only a quarantined Run can be discarded");
+      }
+      const agent = database.agents.find((item) => item.id === run.agentId);
+      if (!agent) throw new HttpError(404, "Agent not found");
+      if (agent.status === "busy") {
+        throw new HttpError(409, "Wait for the active Agent operation to finish");
+      }
+      run.runVault.outcome = "discarded";
+      run.runVault.resolution = "human_discarded";
+      run.runVault.decidedAt = now();
+      return structuredClone(run);
+    });
+    const stagingId = updated.runVault?.stagingWorkspaceId;
+    if (stagingId) {
+      await this.runVaultWorkspaces
+        .discardStagingWorkspace(stagingId)
+        .catch(() => undefined);
+    }
+    return updated;
+  }
+
   async sendMessage(
     agentId: string,
     prompt: string,
@@ -170,6 +386,7 @@ export class AgentService {
       output: null,
       error: null,
       usage: null,
+      runVault: null,
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
@@ -240,48 +457,226 @@ export class AgentService {
         storedRun.startedAt = now();
       }
     });
+    let staging: StagingWorkspace | null = null;
+    let runnerResult: RunnerResult | null = null;
+    let promotionCommitted = false;
+    let verification = skippedVerification(
+      "Verification was not run because Agent execution did not complete.",
+    );
     try {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
-      const result = await this.runner.run({
+      staging = await this.runVaultWorkspaces.createStagingWorkspace(
+        run.id,
+        agentAtStart.workspacePath,
+      );
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+      runnerResult = await this.runner.run({
         agentId: agentAtStart.id,
-        workspacePath: agentAtStart.workspacePath,
+        workspacePath: staging.path,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
       });
-      const completedAt = now();
-      await this.store.mutate((database) => {
-        const storedRun = database.runs.find((item) => item.id === run.id);
-        const agent = database.agents.find((item) => item.id === agentAtStart.id);
-        if (!storedRun || !agent) return;
-        storedRun.status = "completed";
-        storedRun.output = result.output;
-        storedRun.usage = result.usage;
-        storedRun.completedAt = completedAt;
-        database.messages.push({
-          id: randomUUID(),
-          agentId: agent.id,
-          runId: run.id,
-          role: "assistant",
-          content: result.output,
-          createdAt: completedAt,
-        });
-        agent.status = "ready";
-        agent.codexThreadId = result.threadId;
-        agent.lastError = null;
-        agent.updatedAt = completedAt;
+      if (runnerResult.threadId === agentAtStart.codexThreadId) {
+        throw new Error("Codex did not create a distinct provisional thread");
+      }
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+
+      const beforeVerification = await this.runVaultWorkspaces.inspectChanges(
+        staging.trustedSnapshot,
+        staging.path,
+      );
+      if (beforeVerification.changes.some((change) => change.symbolicLink)) {
+        verification = skippedVerification(
+          "Verification was skipped because the staged workspace introduced a symbolic link.",
+        );
+      } else {
+        const controller = new AbortController();
+        this.verificationControllers.set(agentAtStart.id, controller);
+        try {
+          verification = verificationEvidence(
+            await this.verifier.verify(staging.path, controller.signal),
+          );
+        } finally {
+          if (this.verificationControllers.get(agentAtStart.id) === controller) {
+            this.verificationControllers.delete(agentAtStart.id);
+          }
+        }
+      }
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+
+      const inspection = await this.runVaultWorkspaces.inspectChanges(
+        staging.trustedSnapshot,
+        staging.path,
+      );
+      const currentTrusted = await this.runVaultWorkspaces.snapshotWorkspace(
+        agentAtStart.workspacePath,
+      );
+      let policy = evaluateRunVaultPolicy({
+        executionStatus: "succeeded",
+        verificationStatus: verification.status,
+        changes: inspection.changes,
+        trustedWorkspaceChanged:
+          currentTrusted.fingerprint !== staging.trustedSnapshot.fingerprint,
       });
+      let decision: RunVaultDecision = {
+        outcome: policy.outcome,
+        reason: policy.reason,
+        resolution: "policy",
+        stagingWorkspaceId: staging.id,
+        provisionalThreadId: runnerResult.threadId,
+        trustedWorkspaceFingerprint: staging.trustedSnapshot.fingerprint,
+        stagingWorkspaceFingerprint: inspection.stagingFingerprint,
+        changedFiles: policy.changedFiles,
+        verification,
+        trustedWorkspaceChanged:
+          currentTrusted.fingerprint !== staging.trustedSnapshot.fingerprint,
+        decidedAt: now(),
+      };
+
+      if (policy.outcome === "promoted") {
+        if (this.cancellationRequests.has(agentAtStart.id)) {
+          throw new RunCancelledError();
+        }
+        let promotion;
+        try {
+          promotion = await this.runVaultWorkspaces.beginPromotion(
+            staging.id,
+            agentAtStart.workspacePath,
+            staging.trustedSnapshot.fingerprint,
+          );
+        } catch (error) {
+          if (!(error instanceof TrustedWorkspaceChangedError)) throw error;
+          policy = evaluateRunVaultPolicy({
+            executionStatus: "succeeded",
+            verificationStatus: verification.status,
+            changes: inspection.changes,
+            trustedWorkspaceChanged: true,
+          });
+          decision = {
+            ...decision,
+            outcome: policy.outcome,
+            reason: policy.reason,
+            changedFiles: policy.changedFiles,
+            trustedWorkspaceChanged: true,
+            decidedAt: now(),
+          };
+        }
+
+        if (promotion) {
+          try {
+            if (this.cancellationRequests.has(agentAtStart.id)) {
+              throw new RunCancelledError();
+            }
+            await this.persistPromotionCommitment(
+              agentAtStart,
+              run,
+              runnerResult,
+              decision,
+            );
+            promotionCommitted = true;
+          } catch (error) {
+            await this.runVaultWorkspaces.rollbackPromotion(promotion);
+            throw error;
+          }
+          await this.runVaultWorkspaces.finalizePromotion(promotion).catch(
+            () => undefined,
+          );
+          await this.publishCommittedPromotion(agentAtStart.id, run.id);
+          return;
+        }
+      }
+
+      await this.persistCompletedRun(
+        agentAtStart,
+        run,
+        runnerResult,
+        decision,
+      );
+      if (decision.outcome === "discarded") {
+        await this.runVaultWorkspaces
+          .discardStagingWorkspace(staging.id)
+          .catch(() => undefined);
+      }
     } catch (error) {
+      if (promotionCommitted) {
+        await this.publishCommittedPromotion(agentAtStart.id, run.id).catch(
+          () => undefined,
+        );
+        return;
+      }
       const completedAt = now();
-      const cancelled = error instanceof RunCancelledError;
+      const cancelled =
+        error instanceof RunCancelledError ||
+        this.cancellationRequests.has(agentAtStart.id);
+      const timedOut = error instanceof RunTimedOutError;
       const message = error instanceof Error ? error.message : String(error);
+      let changes: RunVaultFileChange[] = [];
+      let stagingWorkspaceFingerprint: string | null = null;
+      let trustedWorkspaceChanged = false;
+      if (staging) {
+        try {
+          const inspection = await this.runVaultWorkspaces.inspectChanges(
+            staging.trustedSnapshot,
+            staging.path,
+          );
+          changes = inspection.changes;
+          stagingWorkspaceFingerprint = inspection.stagingFingerprint;
+        } catch {
+          changes = [];
+        }
+        try {
+          trustedWorkspaceChanged =
+            (
+              await this.runVaultWorkspaces.snapshotWorkspace(
+                agentAtStart.workspacePath,
+              )
+            ).fingerprint !== staging.trustedSnapshot.fingerprint;
+        } catch {
+          trustedWorkspaceChanged = false;
+        }
+      }
+      const executionStatus: RunVaultExecutionStatus = cancelled
+        ? "cancelled"
+        : timedOut
+          ? "timed_out"
+          : "failed";
+      const policy = evaluateRunVaultPolicy({
+        executionStatus,
+        verificationStatus: verification.status,
+        changes,
+        trustedWorkspaceChanged,
+      });
+      const decision: RunVaultDecision = {
+        outcome: policy.outcome,
+        reason: policy.reason,
+        resolution: "policy",
+        stagingWorkspaceId: staging?.id ?? null,
+        provisionalThreadId: runnerResult?.threadId ?? null,
+        trustedWorkspaceFingerprint:
+          staging?.trustedSnapshot.fingerprint ?? null,
+        stagingWorkspaceFingerprint,
+        changedFiles: policy.changedFiles,
+        verification,
+        trustedWorkspaceChanged,
+        decidedAt: completedAt,
+      };
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
         if (storedRun) {
           storedRun.status = cancelled ? "cancelled" : "failed";
+          storedRun.output = runnerResult?.output ?? null;
+          storedRun.usage = runnerResult?.usage ?? null;
           storedRun.error = message;
+          storedRun.runVault = decision;
           storedRun.completedAt = completedAt;
         }
         if (agent) {
@@ -292,7 +687,232 @@ export class AgentService {
           agent.updatedAt = completedAt;
         }
       });
+      if (staging) {
+        await this.runVaultWorkspaces
+          .discardStagingWorkspace(staging.id)
+          .catch(() => undefined);
+      }
     }
+  }
+
+  private async persistCompletedRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    result: RunnerResult,
+    decision: RunVaultDecision,
+  ): Promise<void> {
+    const completedAt = now();
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === run.id);
+      const agent = database.agents.find((item) => item.id === agentAtStart.id);
+      if (!storedRun || !agent) return;
+      storedRun.status = "completed";
+      storedRun.output = result.output;
+      storedRun.usage = result.usage;
+      storedRun.runVault = decision;
+      storedRun.completedAt = completedAt;
+      agent.status = "ready";
+      agent.lastError = null;
+      agent.updatedAt = completedAt;
+    });
+  }
+
+  private async persistPromotionCommitment(
+    agentAtStart: Agent,
+    run: AgentRun,
+    result: RunnerResult,
+    decision: RunVaultDecision,
+  ): Promise<void> {
+    const committedAt = now();
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === run.id);
+      const agent = database.agents.find((item) => item.id === agentAtStart.id);
+      if (!storedRun || !agent) {
+        throw new Error("Run or Agent disappeared while promotion was committed");
+      }
+      storedRun.output = result.output;
+      storedRun.usage = result.usage;
+      storedRun.runVault = decision;
+      if (
+        !database.messages.some(
+          (message) => message.runId === run.id && message.role === "assistant",
+        )
+      ) {
+        database.messages.push({
+          id: randomUUID(),
+          agentId: agent.id,
+          runId: run.id,
+          role: "assistant",
+          content: result.output,
+          createdAt: committedAt,
+        });
+      }
+      agent.codexThreadId = result.threadId;
+      agent.lastError = null;
+      agent.updatedAt = committedAt;
+    });
+  }
+
+  private async publishCommittedPromotion(
+    agentId: string,
+    runId: string,
+  ): Promise<void> {
+    const completedAt = now();
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === runId);
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!storedRun || !agent) {
+        throw new Error("Run or Agent disappeared while promotion was finalized");
+      }
+      if (storedRun.runVault?.outcome !== "promoted") {
+        throw new Error("RunVault promotion commitment is missing");
+      }
+      storedRun.status = "completed";
+      storedRun.error = null;
+      storedRun.completedAt = completedAt;
+      if (agent.status !== "stopped") {
+        agent.status = "ready";
+      }
+      agent.lastError = null;
+      agent.updatedAt = completedAt;
+    });
+  }
+
+  private async promoteQuarantinedRun(
+    runAtStart: AgentRun,
+    agentAtStart: Agent,
+    previousStatus: Agent["status"],
+  ): Promise<AgentRun> {
+    const decision = runAtStart.runVault;
+    if (
+      !decision ||
+      !decision.stagingWorkspaceId ||
+      !decision.provisionalThreadId ||
+      !decision.trustedWorkspaceFingerprint ||
+      !decision.stagingWorkspaceFingerprint ||
+      !runAtStart.output
+    ) {
+      await this.releaseDecisionReservation(agentAtStart.id, previousStatus);
+      throw new HttpError(409, "Quarantined Run evidence is incomplete");
+    }
+
+    let promotion: RunVaultPromotion | null = null;
+    try {
+      let stagedSnapshot;
+      try {
+        stagedSnapshot = await this.runVaultWorkspaces.snapshotWorkspace(
+          this.runVaultWorkspaces.stagingPath(decision.stagingWorkspaceId),
+        );
+      } catch {
+        throw new HttpError(
+          409,
+          "Quarantined staging workspace is unavailable or unreadable",
+        );
+      }
+      if (stagedSnapshot.fingerprint !== decision.stagingWorkspaceFingerprint) {
+        throw new HttpError(
+          409,
+          "Quarantined staging files changed after inspection; discard this Run",
+        );
+      }
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+      promotion = await this.runVaultWorkspaces.beginPromotion(
+        decision.stagingWorkspaceId,
+        agentAtStart.workspacePath,
+        decision.trustedWorkspaceFingerprint,
+      );
+      if (this.cancellationRequests.has(agentAtStart.id)) {
+        throw new RunCancelledError();
+      }
+
+      const completedAt = now();
+      const updated = await this.store.mutate((database) => {
+        const run = database.runs.find((item) => item.id === runAtStart.id);
+        const agent = database.agents.find((item) => item.id === agentAtStart.id);
+        if (!run || !agent) throw new HttpError(404, "Run or Agent not found");
+        if (run.runVault?.outcome !== "quarantined") {
+          throw new HttpError(409, "RunVault decision changed during approval");
+        }
+        run.runVault.outcome = "promoted";
+        run.runVault.resolution = "human_approved";
+        run.runVault.decidedAt = completedAt;
+        agent.codexThreadId = decision.provisionalThreadId;
+        agent.status = previousStatus === "stopped" ? "stopped" : "ready";
+        agent.lastError = null;
+        agent.updatedAt = completedAt;
+        if (
+          !database.messages.some(
+            (message) => message.runId === run.id && message.role === "assistant",
+          )
+        ) {
+          database.messages.push({
+            id: randomUUID(),
+            agentId: agent.id,
+            runId: run.id,
+            role: "assistant",
+            content: runAtStart.output as string,
+            createdAt: completedAt,
+          });
+        }
+        return structuredClone(run);
+      });
+      await this.runVaultWorkspaces.finalizePromotion(promotion).catch(
+        () => undefined,
+      );
+      return updated;
+    } catch (error) {
+      if (promotion) {
+        try {
+          await this.runVaultWorkspaces.rollbackPromotion(promotion);
+        } catch (rollbackError) {
+          throw new Error("RunVault could not roll back a failed approval", {
+            cause: rollbackError,
+          });
+        }
+      }
+      const trustedChanged = error instanceof TrustedWorkspaceChangedError;
+      await this.store.mutate((database) => {
+        const run = database.runs.find((item) => item.id === runAtStart.id);
+        const agent = database.agents.find((item) => item.id === agentAtStart.id);
+        if (trustedChanged && run?.runVault?.outcome === "quarantined") {
+          run.runVault.reason = "trusted_workspace_changed";
+          run.runVault.trustedWorkspaceChanged = true;
+          run.runVault.decidedAt = now();
+        }
+        if (agent?.status === "busy") {
+          agent.status = previousStatus === "stopped" ? "stopped" : "ready";
+          agent.updatedAt = now();
+        }
+      });
+      if (trustedChanged) {
+        throw new HttpError(
+          409,
+          "Trusted workspace changed after quarantine; approval was not applied",
+        );
+      }
+      if (error instanceof RunCancelledError) {
+        throw new HttpError(409, "Run approval was cancelled");
+      }
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new HttpError(409, "Trusted workspace is unavailable");
+      }
+      throw error;
+    }
+  }
+
+  private async releaseDecisionReservation(
+    agentId: string,
+    previousStatus: Agent["status"],
+  ): Promise<void> {
+    await this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (agent?.status === "busy") {
+        agent.status = previousStatus === "stopped" ? "stopped" : "ready";
+        agent.updatedAt = now();
+      }
+    });
   }
 
   private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {
@@ -314,6 +934,7 @@ export class AgentService {
   private async cancelExecution(agentId: string): Promise<void> {
     this.cancellationRequests.add(agentId);
     try {
+      this.verificationControllers.get(agentId)?.abort();
       await this.runner.cancel(agentId);
       const execution = this.activeExecutions.get(agentId);
       if (execution) {

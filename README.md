@@ -1,15 +1,16 @@
-# Volc Agent Launchpad
+# RunVault
 
-A minimal Agent platform for three-day middleware hackathons. It provides Agent
-CRUD, a browser Playground, persistent workspaces, and Codex CLI backed by the
-Volcengine Ark Responses API.
+Transactional workspace middleware for AI coding agents, built on the Volc
+Agent Launchpad baseline. Every Agent Run is staged, inspected, and verified
+before its workspace and Codex thread can become trusted state.
 
 Run it locally with Docker, Colima, or rootless Podman, or deploy it to
 Volcengine ECS.
 
 > [!WARNING]
-> This is a single-user proof of concept. It intentionally has no identity,
-> tracing, audit, or hardened sandbox middleware. Do not use production data or
+> This is a single-user proof of concept. RunVault provides a narrow
+> transactional-workspace guarantee; it is not identity middleware, malware
+> detection, or a hardened security sandbox. Do not use production data or
 > credentials. See [SECURITY.md](SECURITY.md).
 
 ## Screenshots
@@ -24,6 +25,13 @@ Volcengine ECS.
 
 ## Features
 
+- Transactional staging for every Agent Run
+- Deterministic promote, quarantine, and discard policy
+- Verification inside staged workspaces before promotion
+- Redacted Run evidence with protected-path metadata
+- Human approval or discard for quarantined work
+- Crash-safe promotion and restart reconciliation
+- Workspace and Codex conversation promoted as one decision
 - React and TypeScript Web UI
 - Agent create, edit, start, stop, delete, and multi-turn chat
 - Fastify control plane with asynchronous Run state
@@ -96,8 +104,21 @@ In the Web UI:
    Create a TypeScript hello-world CLI, add a test, and run it.
    ```
 
-The Agent can write files, run commands, and continue the same Codex session in
-later messages.
+The Agent can write files and run commands. Later messages fork from the last
+promoted Codex session, keeping discarded or quarantined context provisional.
+
+After each completed Run, inspect the **RunVault decision** panel. Safe,
+verified work is promoted automatically. Risky changes remain isolated and
+offer **Approve and promote** and **Discard staged work** controls.
+
+To exercise quarantine deliberately, try:
+
+```text
+Update deploy/production.yml with a new production rollout configuration.
+```
+
+RunVault shows the protected path and verification metadata, but never displays
+the protected file's contents in its decision evidence.
 
 ### 5. Stop and resume
 
@@ -159,7 +180,7 @@ docker compose down
 ```bash
 npm install
 cp .env.example .env
-npm install --global @openai/codex@0.111.0
+npm install --global @openai/codex@0.150.1
 npm run dev
 ```
 
@@ -214,16 +235,27 @@ See [.env.example](.env.example) for all Runtime and resource-limit options.
 
 ```mermaid
 flowchart LR
-    UI["React Web UI"] --> API["Fastify control plane"]
-    API --> Store["JSON metadata and Agent workspaces"]
-    API --> Runtime{"Runtime provider"}
-    Runtime -->|Local POC| Container["Disposable Docker / Colima / Podman container"]
-    Runtime -->|ECS profile| Codex["Codex CLI in application container"]
-    Container --> Ark["Volcengine Ark Responses API"]
-    Codex --> Ark
+    UI["React Playground"] --> API["Fastify control plane"]
+    API --> Stage["RunVault staging workspace"]
+    Stage --> Runtime{"Codex Runtime"}
+    Runtime --> Inspect["Inspect changes"]
+    Inspect --> Verify["Run configured tests"]
+    Verify --> Decide{"RunVault policy"}
+    Decide -->|Promote| Trusted["Trusted workspace + Codex thread"]
+    Decide -->|Quarantine| Review["Retained staging + human review"]
+    Decide -->|Discard| Cleanup["Remove staged state"]
+    Runtime --> Ark["Volcengine Ark Responses API"]
 ```
 
-The first turn uses `codex exec`; later turns resume the stored Codex thread.
+The trusted workspace is never passed to the Agent runner. The first turn uses
+`codex exec` in staging; later turns use `codex exec fork` from the last
+promoted thread. Promotion uses a same-filesystem swap with a retained backup,
+and startup reconciliation repairs interrupted transactions.
+
+RunVault's deliberate guarantee is:
+
+> An Agent cannot silently turn unverified work into persistent workspace state.
+
 Deleting an Agent archives its workspace under `workspaces/.deleted/`.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for component and extension
@@ -236,6 +268,12 @@ npm run check
 terraform fmt -check -recursive deploy/volcengine
 docker compose config
 ```
+
+The automated workspace safety corpus covers safe source and documentation
+changes, protected and secret-like paths, dependency files, change limits,
+verification failures, runner failures, cancellation, timeout, approval,
+discard, provisional Codex threads, and crash recovery. Risky and interrupted
+scenarios assert that the trusted workspace content or fingerprint is unchanged.
 
 ## Documentation
 

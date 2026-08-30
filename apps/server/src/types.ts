@@ -2,6 +2,65 @@ export type AgentStatus = "ready" | "busy" | "stopped" | "error";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type MessageRole = "user" | "assistant";
 
+export type RunVaultOutcome = "promoted" | "quarantined" | "discarded";
+
+export type RunVaultReason =
+  | "verified_safe"
+  | "protected_path"
+  | "change_limit_exceeded"
+  | "dependency_change"
+  | "verification_failed"
+  | "run_failed"
+  | "cancelled"
+  | "timed_out"
+  | "unsafe_file"
+  | "unsafe_link"
+  | "trusted_workspace_changed";
+
+export type RunVaultVerificationStatus = "passed" | "failed" | "skipped";
+export type RunVaultChangeKind = "added" | "modified" | "deleted";
+export type RunVaultResolution =
+  | "policy"
+  | "human_approved"
+  | "human_discarded";
+
+export interface RunVaultFileChange {
+  path: string;
+  kind: RunVaultChangeKind;
+  protected: boolean;
+  dependencyFile: boolean;
+  executable: boolean;
+  binary: boolean;
+  symbolicLink: boolean;
+}
+
+export interface RunVaultChangeSummary {
+  addedCount: number;
+  modifiedCount: number;
+  deletedCount: number;
+  protectedPathsTouched: string[];
+}
+
+export interface RunVaultVerification {
+  status: RunVaultVerificationStatus;
+  command: string | null;
+  redactedSummary: string | null;
+}
+
+export interface RunVaultDecision {
+  outcome: RunVaultOutcome;
+  reason: RunVaultReason;
+  resolution: RunVaultResolution;
+  stagingWorkspaceId: string | null;
+  provisionalThreadId: string | null;
+  trustedWorkspaceFingerprint: string | null;
+  stagingWorkspaceFingerprint: string | null;
+  changedFiles: RunVaultChangeSummary;
+  verification: RunVaultVerification;
+  trustedWorkspaceChanged: boolean;
+  decidedAt: string;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -38,6 +97,7 @@ export interface AgentRun {
   output: string | null;
   error: string | null;
   usage: RunUsage | null;
+  runVault: RunVaultDecision | null;
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
@@ -64,7 +124,7 @@ export interface UpdateAgentInput {
 
 export interface RunnerResult {
   output: string;
-  threadId: string | null;
+  threadId: string;
   usage: RunUsage | null;
 }
 
