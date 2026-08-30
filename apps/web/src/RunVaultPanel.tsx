@@ -14,6 +14,7 @@ interface RunVaultPanelProps {
   run: AgentRun;
   action: RunVaultAction | null;
   onAction: (action: RunVaultAction) => void;
+  approvalDisabled?: boolean;
 }
 
 function fileSummary(run: AgentRun): string {
@@ -24,7 +25,12 @@ function fileSummary(run: AgentRun): string {
   return `${total} file${total === 1 ? "" : "s"} changed`;
 }
 
-export function RunVaultPanel({ run, action, onAction }: RunVaultPanelProps) {
+export function RunVaultPanel({
+  run,
+  action,
+  onAction,
+  approvalDisabled = false,
+}: RunVaultPanelProps) {
   const decision = run.runVault;
   if (!decision) return null;
   const awaitingDecision = decision.outcome === "quarantined";
@@ -132,7 +138,7 @@ export function RunVaultPanel({ run, action, onAction }: RunVaultPanelProps) {
             <button
               type="button"
               className="button runvault-approve"
-              disabled={action !== null}
+              disabled={action !== null || approvalDisabled}
               onClick={() => onAction("approve")}
             >
               {action === "approve" ? "Promoting…" : "Approve and promote"}

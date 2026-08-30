@@ -489,6 +489,79 @@ describe("Agent lifecycle", () => {
     expect(service.getMessages(agent.id).map((message) => message.role)).toEqual(["user"]);
   });
 
+  it("revalidates retained review state and serves only safe recorded diffs", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "package-lock.json"), "staged\n");
+        await writeFile(path.join(request.workspacePath, "large.txt"), "x".repeat(70_000));
+        await writeFile(
+          path.join(request.workspacePath, "binary.dat"),
+          Buffer.from([0, 1, 2, 3]),
+        );
+        await mkdir(path.join(request.workspacePath, "deploy"));
+        await writeFile(
+          path.join(request.workspacePath, "deploy", "secret.txt"),
+          "PROTECTED-CONTENT\n",
+        );
+        return { output: "Prepared review", threadId: "review-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Review builder" });
+    await writeFile(path.join(agent.workspacePath, "package-lock.json"), "trusted\n");
+    const { run } = await service.sendMessage(agent.id, "prepare review");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    await expect(service.getRunVaultReview(run.id)).resolves.toMatchObject({
+      availability: "available",
+      stagingFingerprintVerified: true,
+      trustedFingerprintVerified: true,
+    });
+    await expect(
+      service.getRunVaultDiff(run.id, "package-lock.json"),
+    ).resolves.toMatchObject({
+      status: "available",
+      diff: expect.stringContaining("-trusted"),
+    });
+    const protectedDiff = await service.getRunVaultDiff(
+      run.id,
+      "deploy/secret.txt",
+    );
+    expect(protectedDiff).toEqual({
+      path: "deploy/secret.txt",
+      status: "protected",
+      diff: null,
+      truncated: false,
+    });
+    expect(JSON.stringify(protectedDiff)).not.toContain("PROTECTED-CONTENT");
+    await expect(service.getRunVaultDiff(run.id, "large.txt")).resolves.toMatchObject({
+      status: "too_large",
+      diff: null,
+    });
+    await expect(service.getRunVaultDiff(run.id, "binary.dat")).resolves.toMatchObject({
+      status: "binary",
+      diff: null,
+    });
+    await expect(
+      service.getRunVaultDiff(run.id, "../deploy/secret.txt"),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    const stagingPath = path.join(
+      path.dirname(agent.workspacePath),
+      ".staging",
+      run.id,
+    );
+    await writeFile(path.join(stagingPath, "package-lock.json"), "tampered\n");
+    await expect(service.getRunVaultReview(run.id)).resolves.toMatchObject({
+      availability: "staging_tampered",
+      stagingFingerprintVerified: false,
+    });
+    await expect(
+      service.getRunVaultDiff(run.id, "package-lock.json"),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
   it("approves quarantined work exactly once and commits its thread", async () => {
     const service = await makeService({
       run: async (request) => {

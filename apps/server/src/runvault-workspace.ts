@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -15,6 +15,11 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import {
+  MAX_REVIEW_FILE_BYTES,
+  MAX_REVIEW_FILE_LINES,
+  validateReviewPath,
+} from "./runvault-review.js";
 import type { Database, RunVaultFileChange } from "./types.js";
 
 const RESERVED_DIRECTORY_NAMES = new Set([".codex", ".staging"]);
@@ -97,6 +102,10 @@ export interface RunVaultPromotion {
   backupWorkspacePath: string;
   markerPath: string;
 }
+
+export type ReviewFileResult =
+  | { status: "available"; text: string }
+  | { status: "missing" | "binary" | "symbolic_link" | "too_large" };
 
 type PromotionPhase = "prepared" | "installed" | "committed";
 
@@ -469,6 +478,52 @@ export class RunVaultWorkspaceManager {
     }
 
     return { changes, stagingFingerprint: stagingSnapshot.fingerprint };
+  }
+
+  async readReviewFile(
+    workspacePath: string,
+    relativePath: string,
+  ): Promise<ReviewFileResult> {
+    const normalized = validateReviewPath(relativePath);
+    const root = path.resolve(workspacePath);
+    if (!isInside(this.workspaceRoot, root) || root === this.workspaceRoot) {
+      throw new Error("Review workspace is outside the managed root");
+    }
+    const candidate = path.resolve(root, ...normalized.split("/"));
+    if (!isInside(root, candidate) || candidate === root) {
+      throw new Error("Review path escapes the workspace");
+    }
+
+    let handle;
+    try {
+      handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return { status: "missing" };
+      if (code === "ELOOP") return { status: "symbolic_link" };
+      throw error;
+    }
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile()) return { status: "symbolic_link" };
+      if (stats.size > MAX_REVIEW_FILE_BYTES) return { status: "too_large" };
+      const contents = await handle.readFile();
+      if (contents.includes(0) || isKnownBinaryPath(normalized)) {
+        return { status: "binary" };
+      }
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(contents);
+      } catch {
+        return { status: "binary" };
+      }
+      if (text.split("\n").length > MAX_REVIEW_FILE_LINES) {
+        return { status: "too_large" };
+      }
+      return { status: "available", text };
+    } finally {
+      await handle.close();
+    }
   }
 
   async discardStagingWorkspace(id: string): Promise<void> {

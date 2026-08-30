@@ -101,6 +101,34 @@ export interface RunVaultVerification {
   redactedSummary: string | null;
 }
 
+export type RunVaultReviewAvailability =
+  | "available"
+  | "not_retained"
+  | "missing"
+  | "staging_tampered"
+  | "trusted_changed";
+
+export interface RunVaultReviewEvidence {
+  runId: string;
+  availability: RunVaultReviewAvailability;
+  message: string;
+  stagingFingerprintVerified: boolean;
+  trustedFingerprintVerified: boolean;
+}
+
+export interface RunVaultTextDiff {
+  path: string;
+  status:
+    | "available"
+    | "protected"
+    | "binary"
+    | "symbolic_link"
+    | "too_large"
+    | "unavailable";
+  diff: string | null;
+  truncated: boolean;
+}
+
 export interface AgentRun {
   id: string;
   agentId: string;

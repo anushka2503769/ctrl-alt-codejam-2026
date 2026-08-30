@@ -29,6 +29,7 @@ Volcengine ECS.
 - Transactional staging for every Agent Run
 - Deterministic promote, quarantine, and discard policy
 - Explicit verification status, with `npm test` run when configured
+- Focused Run review with findings, file classifications, and safe bounded diffs
 - Redacted Run evidence with protected-path metadata
 - Human approval or discard for quarantined work
 - Crash-safe promotion and restart reconciliation

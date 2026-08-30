@@ -79,6 +79,36 @@ export interface RunVaultDecision {
   decidedAt: string;
 }
 
+export type RunVaultReviewAvailability =
+  | "available"
+  | "not_retained"
+  | "missing"
+  | "staging_tampered"
+  | "trusted_changed";
+
+export interface RunVaultReview {
+  runId: string;
+  availability: RunVaultReviewAvailability;
+  message: string;
+  stagingFingerprintVerified: boolean;
+  trustedFingerprintVerified: boolean;
+}
+
+export type RunVaultDiffStatus =
+  | "available"
+  | "protected"
+  | "binary"
+  | "symbolic_link"
+  | "too_large"
+  | "unavailable";
+
+export interface RunVaultTextDiff {
+  path: string;
+  status: RunVaultDiffStatus;
+  diff: string | null;
+  truncated: boolean;
+}
+
 export interface Agent {
   id: string;
   name: string;

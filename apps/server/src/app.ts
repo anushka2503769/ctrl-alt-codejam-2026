@@ -22,6 +22,7 @@ const updateAgentBody = createAgentBody.partial().refine(
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
 });
+const reviewDiffQuery = z.object({ path: z.string().min(1).max(500) });
 
 export async function createApp(
   config: AppConfig,
@@ -126,6 +127,17 @@ export async function createApp(
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
     return { run: service.getRun(id) };
+  });
+
+  app.get("/api/runs/:id/runvault/review", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    return { review: await service.getRunVaultReview(id) };
+  });
+
+  app.get("/api/runs/:id/runvault/diff", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    const { path } = reviewDiffQuery.parse(request.query);
+    return { diff: await service.getRunVaultDiff(id, path) };
   });
 
   app.post("/api/runs/:id/approve", async (request) => {

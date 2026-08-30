@@ -73,4 +73,30 @@ describe("HTTP boundary", () => {
     expect(discardRun).toHaveBeenCalledWith(runId);
     await app.close();
   });
+
+  it("exposes retained review and encoded diff paths", async () => {
+    const runId = "123e4567-e89b-42d3-a456-426614174000";
+    const getRunVaultReview = vi.fn(async (id: string) => ({ id, availability: "available" }));
+    const getRunVaultDiff = vi.fn(async (id: string, path: string) => ({ id, path }));
+    const reviewService = {
+      getRunVaultReview,
+      getRunVaultDiff,
+    } as unknown as AgentService;
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), reviewService);
+
+    const review = await app.inject({
+      method: "GET",
+      url: `/api/runs/${runId}/runvault/review`,
+    });
+    const diff = await app.inject({
+      method: "GET",
+      url: `/api/runs/${runId}/runvault/diff?path=src%2Findex.ts`,
+    });
+
+    expect(review.statusCode).toBe(200);
+    expect(diff.statusCode).toBe(200);
+    expect(getRunVaultReview).toHaveBeenCalledWith(runId);
+    expect(getRunVaultDiff).toHaveBeenCalledWith(runId, "src/index.ts");
+    await app.close();
+  });
 });

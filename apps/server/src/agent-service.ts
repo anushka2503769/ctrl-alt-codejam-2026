@@ -10,6 +10,10 @@ import {
   evaluateRunVaultPolicy,
   type RunVaultExecutionStatus,
 } from "./runvault-policy.js";
+import {
+  buildBoundedTextDiff,
+  validateReviewPath,
+} from "./runvault-review.js";
 import { RunVaultVerifier } from "./runvault-verifier.js";
 import {
   RunVaultWorkspaceManager,
@@ -26,6 +30,8 @@ import type {
   Message,
   RunVaultDecision,
   RunVaultFileChange,
+  RunVaultReview,
+  RunVaultTextDiff,
   RunVaultVerification,
   RunnerResult,
   UpdateAgentInput,
@@ -266,6 +272,148 @@ export class AgentService {
       .snapshot()
       .runs.filter((run) => run.agentId === agentId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async getRunVaultReview(runId: string): Promise<RunVaultReview> {
+    const run = this.getRun(runId);
+    const decision = run.runVault;
+    if (!decision) throw new HttpError(404, "RunVault decision not found");
+    if (
+      decision.outcome !== "quarantined" ||
+      !decision.stagingWorkspaceId ||
+      !decision.stagingWorkspaceFingerprint ||
+      !decision.trustedWorkspaceFingerprint
+    ) {
+      return {
+        runId,
+        availability: "not_retained",
+        message: "Staged files are no longer retained; persisted evidence remains available.",
+        stagingFingerprintVerified: false,
+        trustedFingerprintVerified: false,
+      };
+    }
+
+    let stagedFingerprint: string;
+    try {
+      stagedFingerprint = (
+        await this.runVaultWorkspaces.snapshotWorkspace(
+          this.runVaultWorkspaces.stagingPath(decision.stagingWorkspaceId),
+        )
+      ).fingerprint;
+    } catch {
+      return {
+        runId,
+        availability: "missing",
+        message: "Retained staging is missing or unreadable. Review actions are unavailable.",
+        stagingFingerprintVerified: false,
+        trustedFingerprintVerified: false,
+      };
+    }
+    if (stagedFingerprint !== decision.stagingWorkspaceFingerprint) {
+      return {
+        runId,
+        availability: "staging_tampered",
+        message: "Retained staging changed after inspection. Contents and actions are unavailable.",
+        stagingFingerprintVerified: false,
+        trustedFingerprintVerified: false,
+      };
+    }
+
+    const agent = this.getAgent(run.agentId);
+    let trustedFingerprint: string;
+    try {
+      trustedFingerprint = (
+        await this.runVaultWorkspaces.snapshotWorkspace(agent.workspacePath)
+      ).fingerprint;
+    } catch {
+      return {
+        runId,
+        availability: "trusted_changed",
+        message: "The trusted workspace is unavailable for comparison.",
+        stagingFingerprintVerified: true,
+        trustedFingerprintVerified: false,
+      };
+    }
+    if (trustedFingerprint !== decision.trustedWorkspaceFingerprint) {
+      return {
+        runId,
+        availability: "trusted_changed",
+        message: "The trusted workspace changed after this Run. Diffs and approval are unavailable.",
+        stagingFingerprintVerified: true,
+        trustedFingerprintVerified: false,
+      };
+    }
+    return {
+      runId,
+      availability: "available",
+      message: "Retained staging and trusted workspace fingerprints are verified.",
+      stagingFingerprintVerified: true,
+      trustedFingerprintVerified: true,
+    };
+  }
+
+  async getRunVaultDiff(
+    runId: string,
+    requestedPath: string,
+  ): Promise<RunVaultTextDiff> {
+    let relativePath: string;
+    try {
+      relativePath = validateReviewPath(requestedPath);
+    } catch {
+      throw new HttpError(400, "Invalid review path");
+    }
+    const run = this.getRun(runId);
+    const decision = run.runVault;
+    if (!decision) throw new HttpError(404, "RunVault decision not found");
+    const change = decision.changedFiles.files.find(
+      (file) => file.path === relativePath,
+    );
+    if (!change) throw new HttpError(404, "File is not in the recorded manifest");
+    const review = await this.getRunVaultReview(runId);
+    if (review.availability !== "available" || !decision.stagingWorkspaceId) {
+      throw new HttpError(409, review.message);
+    }
+    if (change.protected) {
+      return { path: relativePath, status: "protected", diff: null, truncated: false };
+    }
+    if (change.symbolicLink) {
+      return { path: relativePath, status: "symbolic_link", diff: null, truncated: false };
+    }
+    if (change.binary) {
+      return { path: relativePath, status: "binary", diff: null, truncated: false };
+    }
+    const agent = this.getAgent(run.agentId);
+    const [before, after] = await Promise.all([
+      this.runVaultWorkspaces.readReviewFile(agent.workspacePath, relativePath),
+      this.runVaultWorkspaces.readReviewFile(
+        this.runVaultWorkspaces.stagingPath(decision.stagingWorkspaceId),
+        relativePath,
+      ),
+    ]);
+    const blocked = [before.status, after.status].find((status) =>
+      ["binary", "symbolic_link", "too_large"].includes(status),
+    );
+    if (blocked) {
+      return {
+        path: relativePath,
+        status: blocked as "binary" | "symbolic_link" | "too_large",
+        diff: null,
+        truncated: false,
+      };
+    }
+    if (before.status === "missing" && after.status === "missing") {
+      return { path: relativePath, status: "unavailable", diff: null, truncated: false };
+    }
+    const rendered = buildBoundedTextDiff(
+      before.status === "available" ? before.text : "",
+      after.status === "available" ? after.text : "",
+    );
+    return {
+      path: relativePath,
+      status: "available",
+      diff: rendered.diff,
+      truncated: rendered.truncated,
+    };
   }
 
   async approveRun(runId: string): Promise<AgentRun> {

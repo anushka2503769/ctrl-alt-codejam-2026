@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
-import { RunVaultPanel, type RunVaultAction } from "./RunVaultPanel";
+import type { RunVaultAction } from "./RunVaultPanel";
+import { RunVaultReview } from "./RunVaultReview";
 import {
   lastMessageIndexes,
   replaceRun,
@@ -668,7 +669,7 @@ export default function App() {
                               )}
                             />
                             {selectedRunId === run.id && run.runVault && (
-                              <RunVaultPanel
+                              <RunVaultReview
                                 run={run}
                                 action={runVaultAction?.runId === run.id
                                   ? runVaultAction.action
@@ -720,7 +721,7 @@ export default function App() {
                       />
                     )}
                     {selectedRunId === run.id && run.runVault && (
-                      <RunVaultPanel
+                      <RunVaultReview
                         run={run}
                         action={runVaultAction?.runId === run.id
                           ? runVaultAction.action

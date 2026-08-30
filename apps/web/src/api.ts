@@ -1,4 +1,11 @@
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type {
+  Agent,
+  AgentRun,
+  Message,
+  RunVaultReviewEvidence,
+  RunVaultTextDiff,
+  SystemInfo,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -78,6 +85,14 @@ export const api = {
       },
     ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+  runVaultReview: (id: string) =>
+    request<{ review: RunVaultReviewEvidence }>(
+      "/api/runs/" + id + "/runvault/review",
+    ),
+  runVaultDiff: (id: string, path: string) =>
+    request<{ diff: RunVaultTextDiff }>(
+      "/api/runs/" + id + "/runvault/diff?path=" + encodeURIComponent(path),
+    ),
   approveRun: (id: string) =>
     request<{ run: AgentRun }>("/api/runs/" + id + "/approve", {
       method: "POST",
