@@ -41,6 +41,9 @@ export async function createApp(
     },
     bodyLimit: 1_048_576,
   });
+  app.addHook("onClose", async () => {
+    service.shutdown?.();
+  });
 
   await app.register(cors, {
     origin:

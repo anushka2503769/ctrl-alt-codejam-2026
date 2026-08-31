@@ -39,12 +39,18 @@ export const reasonCopy: Record<RunVaultReason, string> = {
   unsafe_file: "Unsafe file type introduced",
   unsafe_link: "Symbolic link introduced",
   trusted_workspace_changed: "Trusted workspace changed during the Run",
+  verification_required: "Policy requires passing verification",
+  verification_unavailable: "Tests were unavailable",
+  change_bytes_exceeded: "Changed-byte limit exceeded",
+  staging_quota_exceeded: "Staging storage quota exceeded",
+  retention_expired: "Quarantine retention expired",
 };
 
 export const resolutionCopy: Record<RunVaultResolution, string> = {
   policy: "Automatic policy decision",
   human_approved: "Applied after operator approval",
   human_discarded: "Not applied after operator discard",
+  expired: "Not applied after quarantine expiry",
 };
 
 export const findingCopy: Record<
@@ -95,6 +101,26 @@ export const findingCopy: Record<
     title: "Deletion limit exceeded",
     explanation: "The Run exceeded the deletion limit.",
   },
+  verification_required: {
+    title: "Verification required",
+    explanation: "The selected policy requires configured verification to pass.",
+  },
+  verification_unavailable: {
+    title: "Verification unavailable",
+    explanation: "Verification could not run with matching managed dependencies.",
+  },
+  change_bytes_exceeded: {
+    title: "Changed-byte limit exceeded",
+    explanation: "The Run exceeded the configured changed-byte limit.",
+  },
+  staging_quota_exceeded: {
+    title: "Staging quota exceeded",
+    explanation: "The Run exceeded managed staging storage limits.",
+  },
+  retention_expired: {
+    title: "Quarantine retention expired",
+    explanation: "The retained staging workspace reached its expiry time.",
+  },
 };
 
 export function verificationCopy(verification: RunVaultVerification): {
@@ -111,6 +137,14 @@ export function verificationCopy(verification: RunVaultVerification): {
     return {
       label: "Tests failed",
       explanation: "The configured test command did not pass.",
+    };
+  }
+  if (verification.status === "unavailable") {
+    return {
+      label: "Tests unavailable",
+      explanation:
+        verification.redactedSummary ??
+        "Verification could not run with the required managed dependencies.",
     };
   }
   const noTestScript = /no (?:package\.json )?test (?:script|command)/i.test(

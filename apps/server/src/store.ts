@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { historicalRunVaultPolicySnapshot } from "./runvault-policy-config.js";
 import type { Database } from "./types.js";
 
 const emptyDatabase = (): Database => ({
@@ -8,6 +9,11 @@ const emptyDatabase = (): Database => ({
   messages: [],
   runs: [],
 });
+
+function validIsoTimestamp(value: string | null | undefined, fallback: string): string {
+  const timestamp = Date.parse(value ?? "");
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
+}
 
 export class JsonStore {
   private data: Database = emptyDatabase();
@@ -40,9 +46,31 @@ export class JsonStore {
             protectedPathsTouched: [],
             files: [],
             omittedFileCount: 0,
+            changedBytes: 0,
           };
           run.runVault.changedFiles.files ??= [];
           run.runVault.changedFiles.omittedFileCount ??= 0;
+          run.runVault.changedFiles.changedBytes ??= 0;
+          run.runVault.policy ??= historicalRunVaultPolicySnapshot(
+            run.createdAt,
+          );
+          if (run.runVault.outcome === "quarantined") {
+            const retainedAt = validIsoTimestamp(
+              run.runVault.retainedAt ?? run.runVault.decidedAt,
+              new Date().toISOString(),
+            );
+            run.runVault.retainedAt = retainedAt;
+            run.runVault.expiresAt = validIsoTimestamp(
+              run.runVault.expiresAt,
+              new Date(
+                Date.parse(retainedAt) +
+                  run.runVault.policy.quarantineRetentionMs,
+              ).toISOString(),
+            );
+          } else {
+            run.runVault.retainedAt ??= null;
+            run.runVault.expiresAt ??= null;
+          }
         }
       }
       this.data = parsed;

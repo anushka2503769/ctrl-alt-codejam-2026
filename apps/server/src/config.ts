@@ -1,6 +1,10 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import {
+  createRunVaultPolicySnapshot,
+  parseProtectedPatterns,
+} from "./runvault-policy-config.js";
 
 const envSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
@@ -17,6 +21,12 @@ const envSchema = z.object({
   CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(2_097_152),
   RUNTIME_PROVIDER: z.enum(["local-process", "container"]).default("local-process"),
   VERIFICATION_PROVIDER: z.enum(["container", "host"]).default("container"),
+  VERIFICATION_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(120_000),
+  VERIFICATION_MAX_OUTPUT_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1_024)
+    .default(16_384),
   VERIFICATION_WORKSPACE_HOST_ROOT: z.string().optional(),
   CONTAINER_WORKSPACE_HOST_ROOT: z.string().optional(),
   CONTAINER_CODEX_HOME_HOST_ROOT: z.string().optional(),
@@ -30,6 +40,36 @@ const envSchema = z.object({
     .int()
     .min(1_000)
     .default(600_000),
+  RUNVAULT_POLICY_PROFILE: z.enum(["standard", "strict"]).default("standard"),
+  RUNVAULT_PROTECTED_PATTERNS: z.string().max(32_768).optional(),
+  RUNVAULT_MAX_CHANGED_FILES: z.coerce.number().int().min(1).max(10_000).optional(),
+  RUNVAULT_MAX_DELETED_FILES: z.coerce.number().int().min(0).max(10_000).optional(),
+  RUNVAULT_MAX_CHANGED_BYTES: z.coerce.number().int().min(1_024).optional(),
+  RUNVAULT_VERIFICATION_MODE: z
+    .enum(["allow-skipped", "require-verification"])
+    .optional(),
+  RUNVAULT_STAGING_PER_RUN_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1_048_576)
+    .optional(),
+  RUNVAULT_STAGING_TOTAL_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1_048_576)
+    .optional(),
+  RUNVAULT_QUARANTINE_RETENTION_MS: z.coerce
+    .number()
+    .int()
+    .min(100)
+    .max(366 * 24 * 60 * 60 * 1_000)
+    .optional(),
+  RUNVAULT_QUOTA_POLL_MS: z.coerce
+    .number()
+    .int()
+    .min(100)
+    .max(60_000)
+    .default(1_000),
   CONTAINER_ENGINE: z.string().min(1).default("docker"),
   CONTAINER_RUNTIME_IMAGE: z.string().min(1).default("volc-agent-runtime:local"),
   CONTAINER_CPU_LIMIT: z.coerce.number().positive().default(2),
@@ -135,6 +175,29 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       "Dependency cache host root must be separate from host workspace and Codex roots",
     );
   }
+  const runVaultPolicy = createRunVaultPolicySnapshot(
+    env.RUNVAULT_POLICY_PROFILE,
+    {
+      protectedPatterns: parseProtectedPatterns(
+        env.RUNVAULT_PROTECTED_PATTERNS,
+      ),
+      maxChangedFiles: env.RUNVAULT_MAX_CHANGED_FILES,
+      maxDeletedFiles: env.RUNVAULT_MAX_DELETED_FILES,
+      maxChangedBytes: env.RUNVAULT_MAX_CHANGED_BYTES,
+      verificationMode: env.RUNVAULT_VERIFICATION_MODE,
+      stagingPerRunBytes: env.RUNVAULT_STAGING_PER_RUN_BYTES,
+      stagingTotalBytes: env.RUNVAULT_STAGING_TOTAL_BYTES,
+      quarantineRetentionMs: env.RUNVAULT_QUARANTINE_RETENTION_MS,
+    },
+    {
+      agentTimeoutMs: env.CODEX_TIMEOUT_MS,
+      verificationTimeoutMs: env.VERIFICATION_TIMEOUT_MS,
+      containerCpuLimit: env.CONTAINER_CPU_LIMIT,
+      containerMemoryLimit: env.CONTAINER_MEMORY_LIMIT,
+      containerPidsLimit: env.CONTAINER_PIDS_LIMIT,
+    },
+    new Date().toISOString(),
+  );
   return {
     host: env.HOST,
     port: env.PORT,
@@ -148,6 +211,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     codexMaxOutputBytes: env.CODEX_MAX_OUTPUT_BYTES,
     runtimeProvider: env.RUNTIME_PROVIDER,
     verificationProvider: env.VERIFICATION_PROVIDER,
+    verificationTimeoutMs: env.VERIFICATION_TIMEOUT_MS,
+    verificationMaxOutputBytes: env.VERIFICATION_MAX_OUTPUT_BYTES,
     verificationWorkspaceHostRoot: path.resolve(
       env.VERIFICATION_WORKSPACE_HOST_ROOT?.trim() || workspaceRoot,
     ),
@@ -157,6 +222,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     dependencyCacheRoot,
     dependencyCacheHostRoot,
     dependencyPreparationTimeoutMs: env.DEPENDENCY_PREPARATION_TIMEOUT_MS,
+    runVaultPolicy,
+    runVaultQuotaPollMs: env.RUNVAULT_QUOTA_POLL_MS,
     containerEngine: env.CONTAINER_ENGINE,
     containerRuntimeImage: env.CONTAINER_RUNTIME_IMAGE,
     containerCpuLimit: env.CONTAINER_CPU_LIMIT,

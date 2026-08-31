@@ -48,6 +48,7 @@ const run: AgentRun = {
         },
       ],
       omittedFileCount: 0,
+      changedBytes: 128,
     },
     findings: [{
       code: "protected_path",
@@ -63,6 +64,28 @@ const run: AgentRun = {
       redactedSummary: "Tests completed.",
     },
     trustedWorkspaceChanged: false,
+    policy: {
+      version: 1,
+      profile: "standard",
+      capturedAt: "2026-01-01T00:00:00.000Z",
+      protectedPatterns: ["deploy/**"],
+      maxChangedFiles: 20,
+      maxDeletedFiles: 5,
+      maxChangedBytes: 26_214_400,
+      verificationMode: "allow-skipped",
+      stagingPerRunBytes: 536_870_912,
+      stagingTotalBytes: 2_147_483_648,
+      quarantineRetentionMs: 604_800_000,
+      runtime: {
+        agentTimeoutMs: 600_000,
+        verificationTimeoutMs: 120_000,
+        containerCpuLimit: 2,
+        containerMemoryLimit: "2g",
+        containerPidsLimit: 256,
+      },
+    },
+    retainedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2026-01-08T00:00:00.000Z",
     decidedAt: "2026-01-01T00:00:00.000Z",
   },
   startedAt: "2026-01-01T00:00:00.000Z",
@@ -88,6 +111,9 @@ describe("RunVault review workspace", () => {
     expect(html).toContain("Protected");
     expect(html).toContain("Dependency");
     expect(html).toContain("Tests passed");
+    expect(html).toContain("standard · allow-skipped");
+    expect(html).toContain("128 changed bytes");
+    expect(html).toContain("expires");
     expect(html).toContain("Approve and promote");
     expect(html).toContain("Discard staged work");
     expect(html).toContain("Create revision Run");

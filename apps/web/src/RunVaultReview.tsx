@@ -137,6 +137,25 @@ export function RunVaultReview({
         </div>
       )}
 
+      <div className="run-lineage" aria-label="RunVault policy snapshot">
+        <strong>Policy snapshot</strong>
+        <span>
+          {decision.policy.profile} · {decision.policy.verificationMode} · {" "}
+          {decision.changedFiles.changedBytes.toLocaleString()} changed bytes
+        </span>
+        <span>
+          Limits: {decision.policy.maxChangedFiles} files · {" "}
+          {decision.policy.maxDeletedFiles} deletions · {" "}
+          {decision.policy.maxChangedBytes.toLocaleString()} bytes
+        </span>
+        {decision.retainedAt && decision.expiresAt && (
+          <span>
+            Retained {new Date(decision.retainedAt).toLocaleString()} · expires {" "}
+            {new Date(decision.expiresAt).toLocaleString()}
+          </span>
+        )}
+      </div>
+
       <div className={`review-availability review-${review?.availability ?? "loading"}`} role="status">
         {reviewError
           ? `Review unavailable: ${reviewError}`

@@ -97,6 +97,26 @@ metadata.
 Staging also records path-free duration, copied-entry, and estimated-byte
 measurements for later operational reporting.
 
+Policy is selected and validated by the server at startup. Built-in protected
+patterns cannot be removed; configured patterns add to them. A deep-cloned
+snapshot is attached to each Run and contains file/deletion/changed-byte
+limits, verification mode, per-Run and total staging quotas, quarantine
+retention, and the effective Agent and verifier Runtime limits. This keeps
+historical decisions explainable even after server configuration changes.
+
+Staging creation is serialized for quota accounting. RunVault checks source
+size before copying, applies a per-Run copy budget, checks per-Run and aggregate
+usage periodically while Codex runs, and checks again before policy and
+promotion. A quota breach cancels execution, discards staging, and leaves the
+trusted workspace and committed thread unchanged.
+
+Quarantined decisions record retention and expiry timestamps. A serialized,
+idempotent sweep marks due Runs discarded with an `expired` resolution before
+removing their staging. Approval and revision reserve the Agent as busy, so an
+expiry sweep cannot race a decision transaction or advance a provisional
+thread. Redacted findings, manifests, verification evidence, fingerprints, and
+the policy snapshot remain in the JSON record after staging cleanup.
+
 New symbolic links are quarantined before verification. Verification invokes
 only the configured `npm test` command in a disposable no-network Runtime
 container with a scrubbed environment, dropped capabilities, resource limits,

@@ -20,6 +20,10 @@ import {
   MAX_REVIEW_FILE_LINES,
   validateReviewPath,
 } from "./runvault-review.js";
+import {
+  DEFAULT_PROTECTED_PATTERNS,
+  matchesProtectedPattern,
+} from "./runvault-policy-config.js";
 import type { Database, RunVaultFileChange } from "./types.js";
 
 const PLATFORM_RESERVED_DIRECTORY_NAMES = new Set([".codex", ".staging"]);
@@ -110,6 +114,17 @@ export interface StagingWorkspace {
 export interface RunVaultWorkspaceInspection {
   changes: RunVaultFileChange[];
   stagingFingerprint: string;
+  changedBytes: number;
+}
+
+export interface StagingQuota {
+  perRunBytes: number;
+  totalBytes: number;
+}
+
+export interface StagingUsage {
+  runBytes: number;
+  totalBytes: number;
 }
 
 export interface RunVaultPromotion {
@@ -162,6 +177,7 @@ type PromotionMarker = PromotionMarkerV1 | PromotionMarkerV2 | PromotionMarkerV3
 
 export class UnsafeWorkspaceEntryError extends Error {}
 export class TrustedWorkspaceChangedError extends Error {}
+export class StagingQuotaExceededError extends Error {}
 
 function isInside(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -182,6 +198,31 @@ async function pathExists(candidate: string): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
+}
+
+async function measureTreeBytes(root: string): Promise<number> {
+  let stats;
+  try {
+    stats = await lstat(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  if (stats.isFile()) return stats.size;
+  if (stats.isSymbolicLink()) {
+    return Buffer.byteLength(await readlink(root));
+  }
+  if (!stats.isDirectory()) {
+    throw new UnsafeWorkspaceEntryError(
+      "Unsupported entry while measuring managed staging",
+    );
+  }
+  const children = await readdir(root, { withFileTypes: true });
+  let total = 0;
+  for (const child of children) {
+    total += await measureTreeBytes(path.join(root, child.name));
+  }
+  return total;
 }
 
 function isPromotionMarker(value: unknown): value is PromotionMarker {
@@ -289,24 +330,15 @@ function shouldExcludeFromCopy(
   );
 }
 
-export function isProtectedRunVaultPath(relativePath: string): boolean {
+export function isProtectedRunVaultPath(
+  relativePath: string,
+  protectedPatterns: readonly string[] = DEFAULT_PROTECTED_PATTERNS,
+): boolean {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\//, "");
   return (
     isGitMetadataPath(normalized) ||
     isDependencyMetadataPath(normalized) ||
-    normalized === ".env" ||
-    normalized.startsWith(".env.") ||
-    normalized === ".codex" ||
-    normalized.startsWith(".codex/") ||
-    normalized === ".staging" ||
-    normalized.startsWith(".staging/") ||
-    normalized === "AGENTS.md" ||
-    normalized === ".github/workflows" ||
-    normalized.startsWith(".github/workflows/") ||
-    normalized === "infra" ||
-    normalized.startsWith("infra/") ||
-    normalized === "deploy" ||
-    normalized.startsWith("deploy/")
+    matchesProtectedPattern(normalized, protectedPatterns)
   );
 }
 
@@ -508,6 +540,7 @@ async function copyWorkspaceEntry(
   stagingRoot: string,
   sourcePath: string,
   excludeGitMetadata: boolean,
+  byteBudget?: { maximum: number; used: number },
 ): Promise<{ entryCount: number; estimatedBytes: number }> {
   const children = await readdir(sourcePath, { withFileTypes: true });
   children.sort((left, right) => left.name.localeCompare(right.name));
@@ -529,15 +562,22 @@ async function copyWorkspaceEntry(
         stagingRoot,
         source,
         excludeGitMetadata,
+        byteBudget,
       );
       entryCount += nested.entryCount;
       estimatedBytes += nested.estimatedBytes;
       continue;
     }
     if (stats.isFile()) {
+      if (byteBudget && byteBudget.used + stats.size > byteBudget.maximum) {
+        throw new StagingQuotaExceededError(
+          `Run staging exceeded its ${byteBudget.maximum}-byte quota while copying source`,
+        );
+      }
       await copyFile(source, destination);
       await chmod(destination, stats.mode & 0o777);
       estimatedBytes += stats.size;
+      if (byteBudget) byteBudget.used += stats.size;
       continue;
     }
     if (stats.isSymbolicLink()) {
@@ -553,8 +593,17 @@ async function copyWorkspaceEntry(
           `Symbolic link escapes the workspace at ${relativePath}`,
         );
       }
+      if (
+        byteBudget &&
+        byteBudget.used + Buffer.byteLength(target) > byteBudget.maximum
+      ) {
+        throw new StagingQuotaExceededError(
+          `Run staging exceeded its ${byteBudget.maximum}-byte quota while copying source`,
+        );
+      }
       await symlink(target, destination);
       estimatedBytes += Buffer.byteLength(target);
+      if (byteBudget) byteBudget.used += Buffer.byteLength(target);
       continue;
     }
 
@@ -797,6 +846,7 @@ function entriesEqual(
 
 export class RunVaultWorkspaceManager {
   private readonly stagingRoot: string;
+  private stagingCreationQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly workspaceRoot: string) {
     this.workspaceRoot = path.resolve(workspaceRoot);
@@ -859,6 +909,17 @@ export class RunVaultWorkspaceManager {
   async createStagingWorkspace(
     id: string,
     trustedWorkspacePath: string,
+    quota?: StagingQuota,
+  ): Promise<StagingWorkspace> {
+    return this.withStagingCreationLock(() =>
+      this.createStagingWorkspaceUnlocked(id, trustedWorkspacePath, quota),
+    );
+  }
+
+  private async createStagingWorkspaceUnlocked(
+    id: string,
+    trustedWorkspacePath: string,
+    quota?: StagingQuota,
   ): Promise<StagingWorkspace> {
     const startedAt = performance.now();
     const stagingPath = this.stagingPath(id);
@@ -872,6 +933,9 @@ export class RunVaultWorkspaceManager {
     }
 
     const trustedSnapshot = await this.snapshotWorkspace(trustedPath);
+    if (quota) {
+      await this.assertCanCreateStaging(trustedSnapshot.estimatedBytes, quota);
+    }
     await mkdir(stagingPath, { recursive: false });
     try {
       const copied = await copyWorkspaceEntry(
@@ -879,7 +943,11 @@ export class RunVaultWorkspaceManager {
         stagingPath,
         trustedPath,
         true,
+        quota
+          ? { maximum: quota.perRunBytes, used: 0 }
+          : undefined,
       );
+      if (quota) await this.assertStagingWithinQuota(stagingPath, quota);
       const afterCopy = await this.snapshotWorkspace(trustedPath);
       if (afterCopy.fingerprint !== trustedSnapshot.fingerprint) {
         throw new Error("Trusted workspace changed while staging was created");
@@ -906,6 +974,27 @@ export class RunVaultWorkspaceManager {
     trustedWorkspacePath: string,
     expectedSourceFingerprint: string,
     expectedTrustedFingerprint: string,
+    quota?: StagingQuota,
+  ): Promise<StagingWorkspace> {
+    return this.withStagingCreationLock(() =>
+      this.createRevisionStagingWorkspaceUnlocked(
+        id,
+        sourceId,
+        trustedWorkspacePath,
+        expectedSourceFingerprint,
+        expectedTrustedFingerprint,
+        quota,
+      ),
+    );
+  }
+
+  private async createRevisionStagingWorkspaceUnlocked(
+    id: string,
+    sourceId: string,
+    trustedWorkspacePath: string,
+    expectedSourceFingerprint: string,
+    expectedTrustedFingerprint: string,
+    quota?: StagingQuota,
   ): Promise<StagingWorkspace> {
     const startedAt = performance.now();
     const sourcePath = this.stagingPath(sourceId);
@@ -922,6 +1011,9 @@ export class RunVaultWorkspaceManager {
         "Retained staging changed before revision",
       );
     }
+    if (quota) {
+      await this.assertCanCreateStaging(sourceSnapshot.estimatedBytes, quota);
+    }
     await mkdir(destinationPath, { recursive: false });
     try {
       const copied = await copyWorkspaceEntry(
@@ -929,7 +1021,11 @@ export class RunVaultWorkspaceManager {
         destinationPath,
         sourcePath,
         false,
+        quota
+          ? { maximum: quota.perRunBytes, used: 0 }
+          : undefined,
       );
+      if (quota) await this.assertStagingWithinQuota(destinationPath, quota);
       const sourceAfterCopy = await this.snapshotWorkspace(sourcePath);
       if (sourceAfterCopy.fingerprint !== expectedSourceFingerprint) {
         throw new UnsafeWorkspaceEntryError(
@@ -955,6 +1051,7 @@ export class RunVaultWorkspaceManager {
   async inspectChanges(
     baseline: WorkspaceSnapshot,
     stagingWorkspacePath: string,
+    protectedPatterns: readonly string[] = DEFAULT_PROTECTED_PATTERNS,
   ): Promise<RunVaultWorkspaceInspection> {
     const stagingPath = path.resolve(stagingWorkspacePath);
     if (!isInside(this.stagingRoot, stagingPath) || stagingPath === this.stagingRoot) {
@@ -1000,7 +1097,7 @@ export class RunVaultWorkspaceManager {
       changes.push({
         path: relativePath,
         kind,
-        protected: isProtectedRunVaultPath(relativePath),
+        protected: isProtectedRunVaultPath(relativePath, protectedPatterns),
         dependencyFile: isDependencyFile(relativePath),
         executable: becameExecutable,
         binary: becameBinary,
@@ -1044,7 +1141,17 @@ export class RunVaultWorkspaceManager {
     }
     changes.sort((left, right) => left.path.localeCompare(right.path));
 
-    return { changes, stagingFingerprint: stagingSnapshot.fingerprint };
+    const changedBytes = changes.reduce((total, change) => {
+      const before = baselineByPath.get(change.path);
+      const after = stagingByPath.get(change.path);
+      return total + Math.max(before?.size ?? 0, after?.size ?? 0);
+    }, 0);
+
+    return {
+      changes,
+      stagingFingerprint: stagingSnapshot.fingerprint,
+      changedBytes,
+    };
   }
 
   async readReviewFile(
@@ -1273,6 +1380,69 @@ export class RunVaultWorkspaceManager {
           force: true,
         });
       }
+    }
+  }
+
+  async stagingUsage(stagingWorkspacePath: string): Promise<StagingUsage> {
+    const stagingPath = path.resolve(stagingWorkspacePath);
+    if (!isInside(this.stagingRoot, stagingPath) || stagingPath === this.stagingRoot) {
+      throw new Error("Staging workspace path is outside the staging root");
+    }
+    const [runBytes, totalBytes] = await Promise.all([
+      measureTreeBytes(stagingPath),
+      measureTreeBytes(this.stagingRoot),
+    ]);
+    return { runBytes, totalBytes };
+  }
+
+  async assertStagingWithinQuota(
+    stagingWorkspacePath: string,
+    quota: StagingQuota,
+  ): Promise<StagingUsage> {
+    const usage = await this.stagingUsage(stagingWorkspacePath);
+    if (usage.runBytes > quota.perRunBytes) {
+      throw new StagingQuotaExceededError(
+        `Run staging exceeded its ${quota.perRunBytes}-byte quota`,
+      );
+    }
+    if (usage.totalBytes > quota.totalBytes) {
+      throw new StagingQuotaExceededError(
+        `Managed staging exceeded its ${quota.totalBytes}-byte total quota`,
+      );
+    }
+    return usage;
+  }
+
+  private async assertCanCreateStaging(
+    estimatedBytes: number,
+    quota: StagingQuota,
+  ): Promise<void> {
+    if (estimatedBytes > quota.perRunBytes) {
+      throw new StagingQuotaExceededError(
+        `Source workspace exceeds the ${quota.perRunBytes}-byte per-Run staging quota`,
+      );
+    }
+    const currentBytes = await measureTreeBytes(this.stagingRoot);
+    if (currentBytes + estimatedBytes > quota.totalBytes) {
+      throw new StagingQuotaExceededError(
+        `Managed staging would exceed its ${quota.totalBytes}-byte total quota`,
+      );
+    }
+  }
+
+  private async withStagingCreationLock<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.stagingCreationQueue;
+    let release!: () => void;
+    this.stagingCreationQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 

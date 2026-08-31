@@ -17,6 +17,7 @@ import {
   isDependencyFile,
   isProtectedRunVaultPath,
   RunVaultWorkspaceManager,
+  StagingQuotaExceededError,
   UnsafeWorkspaceEntryError,
 } from "./runvault-workspace.js";
 
@@ -236,6 +237,12 @@ describe("RunVaultWorkspaceManager", () => {
       expect.objectContaining({ path: "mode.sh", kind: "modified", executable: true }),
       expect.objectContaining({ path: "modify.ts", kind: "modified" }),
     ]);
+    expect(inspection.changedBytes).toBe(
+      Buffer.byteLength("new\n") +
+      Buffer.byteLength("delete me\n") +
+      Buffer.byteLength("#!/bin/sh\n") +
+      Buffer.byteLength("before\n"),
+    );
   });
 
   it("classifies protected paths without exposing their contents", async () => {
@@ -254,6 +261,58 @@ describe("RunVaultWorkspaceManager", () => {
     expect(inspection.changes.filter((item) => item.protected).map((item) => item.path))
       .toEqual([".env.production", ".github/workflows/ci.yml", "deploy/app.yml"]);
     expect(JSON.stringify(inspection)).not.toContain("do-not-return");
+  });
+
+  it("applies custom protection in addition to built-in protections", async () => {
+    const staging = await stage();
+    await mkdir(path.join(staging.path, "secrets"));
+    await writeFile(path.join(staging.path, "secrets", "token.txt"), "hidden\n");
+    await writeFile(path.join(staging.path, ".env"), "TOKEN=also-hidden\n");
+
+    const inspection = await manager.inspectChanges(
+      staging.trustedSnapshot,
+      staging.path,
+      [".env", "secrets/**"],
+    );
+
+    expect(inspection.changes.map((change) => [change.path, change.protected]))
+      .toEqual([
+        [".env", true],
+        ["secrets/token.txt", true],
+      ]);
+    expect(JSON.stringify(inspection)).not.toContain("hidden");
+  });
+
+  it("rejects a source that exceeds the per-Run staging quota", async () => {
+    await writeFile(path.join(trusted, "large.bin"), Buffer.alloc(1_048_577));
+
+    await expect(
+      manager.createStagingWorkspace("quota-run", trusted, {
+        perRunBytes: 1_048_576,
+        totalBytes: 2_097_152,
+      }),
+    ).rejects.toBeInstanceOf(StagingQuotaExceededError);
+    await expect(lstat(manager.stagingPath("quota-run"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(lstat(path.join(trusted, "large.bin"))).resolves.toBeDefined();
+  });
+
+  it("serializes staging creation against the total quota", async () => {
+    await writeFile(path.join(trusted, "source.bin"), Buffer.alloc(700_000));
+    const quota = { perRunBytes: 1_048_576, totalBytes: 1_300_000 };
+
+    const attempts = await Promise.allSettled([
+      manager.createStagingWorkspace("quota-a", trusted, quota),
+      manager.createStagingWorkspace("quota-b", trusted, quota),
+    ]);
+
+    expect(attempts.filter((attempt) => attempt.status === "fulfilled"))
+      .toHaveLength(1);
+    const rejected = attempts.find((attempt) => attempt.status === "rejected");
+    expect(rejected).toMatchObject({
+      reason: expect.any(StagingQuotaExceededError),
+    });
   });
 
   it.each([

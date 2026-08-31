@@ -32,6 +32,16 @@ credentials, personal data, or exploit details in an issue.
   Each request requires an explicit network confirmation and runs constrained
   `npm ci --ignore-scripts`; registry packages remain untrusted executable code
   when later imported by an Agent or test process.
+- RunVault enforces configured per-Run and aggregate staging byte limits before
+  copying, during execution, and before promotion. During execution these are
+  application-level periodic measurements, not filesystem or block-device
+  quotas, so a fast writer can temporarily pass the configured threshold before
+  cancellation completes. Keep adequate disk headroom and use host-level disk
+  quotas for stronger exhaustion resistance.
+- Quarantined staging expires under the configured retention policy. Expiry
+  preserves bounded redacted evidence but permanently removes the reviewable
+  staged files; operators should approve, revise, or export anything needed
+  before `expiresAt`.
 - Broad outbound network access
 - Prompt-triggered command and file execution
 - Ark key available to the server and active Runtime container

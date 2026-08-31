@@ -14,6 +14,7 @@ import {
   RunTimedOutError,
 } from "./errors.js";
 import {
+  MAX_FINDINGS,
   evaluateRunVaultPolicy,
   type RunVaultExecutionStatus,
 } from "./runvault-policy.js";
@@ -25,6 +26,8 @@ import { RunVaultVerifier } from "./runvault-verifier.js";
 import { createVerifier } from "./verifier-factory.js";
 import {
   RunVaultWorkspaceManager,
+  StagingQuotaExceededError,
+  type StagingQuota,
   TrustedWorkspaceChangedError,
   UnsafeWorkspaceEntryError,
   type RunVaultPromotion,
@@ -42,7 +45,9 @@ import type {
   RunVaultReview,
   RunVaultTextDiff,
   RunVaultVerification,
+  RunVaultPolicySnapshot,
   RunnerResult,
+  RunnerRequest,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -62,6 +67,28 @@ const skippedVerification = (summary: string): RunVaultVerification => ({
   command: null,
   redactedSummary: summary,
 });
+
+const unavailableVerification = (summary: string): RunVaultVerification => ({
+  status: "unavailable",
+  command: null,
+  redactedSummary: summary,
+});
+
+function retentionForOutcome(
+  outcome: RunVaultDecision["outcome"],
+  decidedAt: string,
+  policy: RunVaultPolicySnapshot,
+): { retainedAt: string | null; expiresAt: string | null } {
+  if (outcome !== "quarantined") {
+    return { retainedAt: null, expiresAt: null };
+  }
+  return {
+    retainedAt: decidedAt,
+    expiresAt: new Date(
+      Date.parse(decidedAt) + policy.quarantineRetentionMs,
+    ).toISOString(),
+  };
+}
 
 function verificationEvidence(
   verification: RunVaultVerification,
@@ -90,6 +117,8 @@ export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<unknown>>();
   private readonly cancellationRequests = new Set<string>();
   private readonly verificationControllers = new Map<string, AbortController>();
+  private retentionTimer: NodeJS.Timeout | null = null;
+  private retentionSweepPromise: Promise<number> | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -115,6 +144,7 @@ export class AgentService {
             continue;
           }
           const completedAt = now();
+          const policy = this.policySnapshot(completedAt);
           run.status = "cancelled";
           run.error = "Server restarted while this run was active";
           run.runVault = {
@@ -127,20 +157,24 @@ export class AgentService {
               run.runVault?.trustedWorkspaceFingerprint ?? null,
             stagingWorkspaceFingerprint:
               run.runVault?.stagingWorkspaceFingerprint ?? null,
-        changedFiles: run.runVault?.changedFiles ?? {
-          addedCount: 0,
-          modifiedCount: 0,
-          deletedCount: 0,
-          protectedPathsTouched: [],
-          files: [],
-          omittedFileCount: 0,
-        },
-        findings: run.runVault?.findings ?? [],
+            changedFiles: run.runVault?.changedFiles ?? {
+              addedCount: 0,
+              modifiedCount: 0,
+              deletedCount: 0,
+              protectedPathsTouched: [],
+              files: [],
+              omittedFileCount: 0,
+              changedBytes: 0,
+            },
+            findings: run.runVault?.findings ?? [],
             verification: skippedVerification(
               "Verification was interrupted when the server restarted.",
             ),
             trustedWorkspaceChanged:
               run.runVault?.trustedWorkspaceChanged ?? false,
+            policy: run.runVault?.policy ?? policy,
+            retainedAt: null,
+            expiresAt: null,
             decidedAt: completedAt,
           };
           run.completedAt = completedAt;
@@ -184,6 +218,12 @@ export class AgentService {
         }
       }
     });
+    await this.sweepExpiredQuarantines();
+  }
+
+  shutdown(): void {
+    if (this.retentionTimer) clearTimeout(this.retentionTimer);
+    this.retentionTimer = null;
   }
 
   listAgents(): Agent[] {
@@ -352,6 +392,7 @@ export class AgentService {
   }
 
   async getRunVaultReview(runId: string): Promise<RunVaultReview> {
+    await this.sweepExpiredQuarantines();
     const run = this.getRun(runId);
     const decision = run.runVault;
     if (!decision) throw new HttpError(404, "RunVault decision not found");
@@ -433,6 +474,7 @@ export class AgentService {
     runId: string,
     requestedPath: string,
   ): Promise<RunVaultTextDiff> {
+    await this.sweepExpiredQuarantines();
     let relativePath: string;
     try {
       relativePath = validateReviewPath(requestedPath);
@@ -494,6 +536,7 @@ export class AgentService {
   }
 
   async approveRun(runId: string): Promise<AgentRun> {
+    await this.sweepExpiredQuarantines();
     const reservation = await this.store.mutate((database) => {
       const run = database.runs.find((item) => item.id === runId);
       if (!run) throw new HttpError(404, "Run not found");
@@ -553,10 +596,12 @@ export class AgentService {
       if (this.activeExecutions.get(reservation.agent.id) === operation) {
         this.activeExecutions.delete(reservation.agent.id);
       }
+      this.scheduleRetentionSweep();
     }
   }
 
   async discardRun(runId: string): Promise<AgentRun> {
+    await this.sweepExpiredQuarantines();
     const updated = await this.store.mutate((database) => {
       const run = database.runs.find((item) => item.id === runId);
       if (!run) throw new HttpError(404, "Run not found");
@@ -591,6 +636,7 @@ export class AgentService {
         .discardStagingWorkspace(stagingId)
         .catch(() => undefined);
     }
+    this.scheduleRetentionSweep();
     return updated;
   }
 
@@ -598,6 +644,7 @@ export class AgentService {
     agentId: string,
     prompt: string,
   ): Promise<{ run: AgentRun; message: Message }> {
+    await this.sweepExpiredQuarantines();
     if (!isArkConfigured(this.config)) {
       throw new HttpError(
         503,
@@ -665,6 +712,7 @@ export class AgentService {
     parentRunId: string,
     instructions: string,
   ): Promise<{ run: AgentRun; message: Message }> {
+    await this.sweepExpiredQuarantines();
     if (!isArkConfigured(this.config)) {
       throw new HttpError(503, "Ark is not configured");
     }
@@ -767,6 +815,7 @@ export class AgentService {
       codexAvailable: await this.runner.isAvailable(),
       codexSandboxMode: this.config.codexSandboxMode,
       dependencyMode: this.config.dependencyMode,
+      runVaultPolicy: this.config.runVaultPolicy,
       runtimeProvider: this.config.runtimeProvider,
       containerEngine:
         this.config.runtimeProvider === "container"
@@ -784,6 +833,11 @@ export class AgentService {
     run: AgentRun,
     revision?: RevisionExecutionContext,
   ): Promise<void> {
+    const policySnapshot = this.policySnapshot(run.createdAt);
+    const stagingQuota = {
+      perRunBytes: policySnapshot.stagingPerRunBytes,
+      totalBytes: policySnapshot.stagingTotalBytes,
+    };
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -808,23 +862,25 @@ export class AgentService {
             agentAtStart.workspacePath,
             revision.sourceStagingFingerprint,
             revision.trustedWorkspaceFingerprint,
+            stagingQuota,
           )
         : await this.runVaultWorkspaces.createStagingWorkspace(
             run.id,
             agentAtStart.workspacePath,
+            stagingQuota,
           );
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
       const initialDependencies = await this.dependencies.resolve(staging.path);
       const initialDependencyMount = dependencyMountForRun(initialDependencies);
-      runnerResult = await this.runner.run({
+      runnerResult = await this.runWithStagingQuota({
         agentId: agentAtStart.id,
         workspacePath: staging.path,
         prompt: run.prompt,
         threadId: revision?.baseThreadId ?? agentAtStart.codexThreadId,
         dependencyCachePath: initialDependencyMount,
-      });
+      }, staging.path, stagingQuota);
       if (runnerResult.threadId === (revision?.baseThreadId ?? agentAtStart.codexThreadId)) {
         throw new Error("Codex did not create a distinct provisional thread");
       }
@@ -835,6 +891,7 @@ export class AgentService {
       const beforeVerification = await this.runVaultWorkspaces.inspectChanges(
         staging.trustedSnapshot,
         staging.path,
+        policySnapshot.protectedPatterns,
       );
       const dependencyFilesChanged = beforeVerification.changes.some(
         (change) => change.dependencyFile,
@@ -852,7 +909,7 @@ export class AgentService {
           throw error;
         }
         dependencyVerificationBlocked = true;
-        verification = skippedVerification(
+        verification = unavailableVerification(
           `${error.message} Verification cannot use stale dependencies after dependency files changed.`,
         );
       }
@@ -864,7 +921,7 @@ export class AgentService {
       ) {
         if (dependencyFilesChanged) {
           dependencyVerificationBlocked = true;
-          verification = skippedVerification(
+          verification = unavailableVerification(
             `${verificationDependencies.message} Verification cannot use stale dependencies after dependency files changed.`,
           );
         } else if (verificationDependencies.status !== "not_applicable") {
@@ -901,6 +958,11 @@ export class AgentService {
       const inspection = await this.runVaultWorkspaces.inspectChanges(
         staging.trustedSnapshot,
         staging.path,
+        policySnapshot.protectedPatterns,
+      );
+      await this.runVaultWorkspaces.assertStagingWithinQuota(
+        staging.path,
+        stagingQuota,
       );
       const currentTrusted = await this.runVaultWorkspaces.snapshotWorkspace(
         agentAtStart.workspacePath,
@@ -909,9 +971,12 @@ export class AgentService {
         executionStatus: "succeeded",
         verificationStatus: verification.status,
         changes: inspection.changes,
+        changedBytes: inspection.changedBytes,
+        policy: policySnapshot,
         trustedWorkspaceChanged:
           currentTrusted.fingerprint !== staging.trustedSnapshot.fingerprint,
       });
+      const initialDecidedAt = now();
       let decision: RunVaultDecision = {
         outcome: policy.outcome,
         reason: policy.reason,
@@ -925,7 +990,9 @@ export class AgentService {
         verification,
         trustedWorkspaceChanged:
           currentTrusted.fingerprint !== staging.trustedSnapshot.fingerprint,
-        decidedAt: now(),
+        policy: policySnapshot,
+        ...retentionForOutcome(policy.outcome, initialDecidedAt, policySnapshot),
+        decidedAt: initialDecidedAt,
       };
 
       if (policy.outcome === "promoted") {
@@ -945,8 +1012,11 @@ export class AgentService {
             executionStatus: "succeeded",
             verificationStatus: verification.status,
             changes: inspection.changes,
+            changedBytes: inspection.changedBytes,
+            policy: policySnapshot,
             trustedWorkspaceChanged: true,
           });
+          const changedAt = now();
           decision = {
             ...decision,
             outcome: policy.outcome,
@@ -954,7 +1024,8 @@ export class AgentService {
             changedFiles: policy.changedFiles,
             findings: policy.findings,
             trustedWorkspaceChanged: true,
-            decidedAt: now(),
+            ...retentionForOutcome(policy.outcome, changedAt, policySnapshot),
+            decidedAt: changedAt,
           };
         }
 
@@ -1002,6 +1073,7 @@ export class AgentService {
         runnerResult,
         decision,
       );
+      this.scheduleRetentionSweep();
     } catch (error) {
       if (promotionCommitted) {
         await this.publishCommittedPromotion(agentAtStart.id, run.id).catch(
@@ -1014,17 +1086,21 @@ export class AgentService {
         error instanceof RunCancelledError ||
         this.cancellationRequests.has(agentAtStart.id);
       const timedOut = error instanceof RunTimedOutError;
+      const quotaExceeded = error instanceof StagingQuotaExceededError;
       const message = error instanceof Error ? error.message : String(error);
       let changes: RunVaultFileChange[] = [];
       let stagingWorkspaceFingerprint: string | null = null;
       let trustedWorkspaceChanged = false;
+      let changedBytes = 0;
       if (staging) {
         try {
           const inspection = await this.runVaultWorkspaces.inspectChanges(
             staging.trustedSnapshot,
             staging.path,
+            policySnapshot.protectedPatterns,
           );
           changes = inspection.changes;
+          changedBytes = inspection.changedBytes;
           stagingWorkspaceFingerprint = inspection.stagingFingerprint;
         } catch {
           changes = [];
@@ -1044,13 +1120,22 @@ export class AgentService {
         ? "cancelled"
         : timedOut
           ? "timed_out"
-          : "failed";
+          : quotaExceeded
+            ? "quota_exceeded"
+            : "failed";
       const policy = evaluateRunVaultPolicy({
         executionStatus,
         verificationStatus: verification.status,
         changes,
+        changedBytes,
+        policy: policySnapshot,
         trustedWorkspaceChanged,
       });
+      const retention = retentionForOutcome(
+        policy.outcome,
+        completedAt,
+        policySnapshot,
+      );
       const decision: RunVaultDecision = {
         outcome: policy.outcome,
         reason: policy.reason,
@@ -1064,6 +1149,8 @@ export class AgentService {
         findings: policy.findings,
         verification,
         trustedWorkspaceChanged,
+        policy: policySnapshot,
+        ...retention,
         decidedAt: completedAt,
       };
       if (staging) {
@@ -1317,6 +1404,157 @@ export class AgentService {
         agent.updatedAt = now();
       }
     });
+  }
+
+  async sweepExpiredQuarantines(referenceTime = Date.now()): Promise<number> {
+    if (this.retentionSweepPromise) return this.retentionSweepPromise;
+    const operation = this.performRetentionSweep(referenceTime).finally(() => {
+      if (this.retentionSweepPromise === operation) {
+        this.retentionSweepPromise = null;
+      }
+      this.scheduleRetentionSweep();
+    });
+    this.retentionSweepPromise = operation;
+    return operation;
+  }
+
+  private async performRetentionSweep(referenceTime: number): Promise<number> {
+    const expired = await this.store.mutate((database) => {
+      const expiredAt = new Date(referenceTime).toISOString();
+      const stagingIds = new Set<string>();
+      let newlyExpired = 0;
+      for (const run of database.runs) {
+        const decision = run.runVault;
+        if (
+          decision?.outcome === "discarded" &&
+          decision.resolution === "expired" &&
+          decision.stagingWorkspaceId
+        ) {
+          stagingIds.add(decision.stagingWorkspaceId);
+          continue;
+        }
+        if (
+          decision?.outcome !== "quarantined" ||
+          !decision.expiresAt ||
+          Date.parse(decision.expiresAt) > referenceTime
+        ) {
+          continue;
+        }
+        const agent = database.agents.find((item) => item.id === run.agentId);
+        if (agent?.status === "busy") continue;
+        if (decision.stagingWorkspaceId) {
+          stagingIds.add(decision.stagingWorkspaceId);
+        }
+        newlyExpired += 1;
+        decision.outcome = "discarded";
+        decision.reason = "retention_expired";
+        decision.resolution = "expired";
+        decision.decidedAt = expiredAt;
+        if (
+          !decision.findings.some(
+            (finding) => finding.code === "retention_expired",
+          ) &&
+          decision.findings.length < MAX_FINDINGS
+        ) {
+          decision.findings.push({
+            code: "retention_expired",
+            severity: "blocking",
+            title: "Quarantine retention expired",
+            explanation:
+              "The retained staging workspace reached its configured expiry time.",
+            paths: [],
+            omittedPathCount: 0,
+          });
+        }
+      }
+      return { newlyExpired, stagingIds: [...stagingIds] };
+    });
+    await Promise.all(
+      expired.stagingIds.map((stagingId) =>
+        this.runVaultWorkspaces
+          .discardStagingWorkspace(stagingId)
+          .catch(() => undefined),
+      ),
+    );
+    return expired.newlyExpired;
+  }
+
+  private scheduleRetentionSweep(): void {
+    if (this.retentionTimer) clearTimeout(this.retentionTimer);
+    this.retentionTimer = null;
+    const expiries = this.store
+      .snapshot()
+      .runs.flatMap((run) =>
+        run.runVault?.outcome === "quarantined" && run.runVault.expiresAt
+          ? [Date.parse(run.runVault.expiresAt)]
+          : [],
+      )
+      .filter(Number.isFinite);
+    if (expiries.length === 0) return;
+    const delay = Math.min(
+      60_000,
+      Math.max(100, Math.min(...expiries) - Date.now()),
+    );
+    this.retentionTimer = setTimeout(() => {
+      void this.sweepExpiredQuarantines().catch(() => undefined);
+    }, delay);
+    this.retentionTimer.unref();
+  }
+
+  private policySnapshot(capturedAt: string): RunVaultPolicySnapshot {
+    return {
+      ...structuredClone(this.config.runVaultPolicy),
+      capturedAt,
+    };
+  }
+
+  private async runWithStagingQuota(
+    request: RunnerRequest,
+    stagingPath: string,
+    quota: StagingQuota,
+  ): Promise<RunnerResult> {
+    let quotaError: StagingQuotaExceededError | null = null;
+    let monitorError: unknown = null;
+    let activeCheck: Promise<void> = Promise.resolve();
+    const check = async (): Promise<void> => {
+      if (quotaError || monitorError) return;
+      try {
+        await this.runVaultWorkspaces.assertStagingWithinQuota(
+          stagingPath,
+          quota,
+        );
+      } catch (error) {
+        if (error instanceof StagingQuotaExceededError) {
+          quotaError = error;
+        } else {
+          monitorError = error;
+        }
+        await this.runner.cancel(request.agentId).catch(() => false);
+      }
+    };
+    const timer = setInterval(() => {
+      activeCheck = activeCheck.then(check);
+    }, this.config.runVaultQuotaPollMs);
+    timer.unref();
+    try {
+      let result: RunnerResult;
+      try {
+        result = await this.runner.run(request);
+      } catch (error) {
+        await activeCheck;
+        if (quotaError) throw quotaError;
+        if (monitorError) throw monitorError;
+        throw error;
+      }
+      await activeCheck;
+      await check();
+      if (quotaError) throw quotaError;
+      if (monitorError) throw monitorError;
+      return result;
+    } finally {
+      clearInterval(timer);
+      await activeCheck;
+    }
   }
 
   private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {

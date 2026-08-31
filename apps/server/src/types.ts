@@ -15,14 +15,49 @@ export type RunVaultReason =
   | "timed_out"
   | "unsafe_file"
   | "unsafe_link"
-  | "trusted_workspace_changed";
+  | "trusted_workspace_changed"
+  | "verification_required"
+  | "verification_unavailable"
+  | "change_bytes_exceeded"
+  | "staging_quota_exceeded"
+  | "retention_expired";
 
-export type RunVaultVerificationStatus = "passed" | "failed" | "skipped";
+export type RunVaultVerificationStatus =
+  | "passed"
+  | "failed"
+  | "skipped"
+  | "unavailable";
 export type RunVaultChangeKind = "added" | "modified" | "deleted";
 export type RunVaultResolution =
   | "policy"
   | "human_approved"
-  | "human_discarded";
+  | "human_discarded"
+  | "expired";
+export type RunVaultVerificationMode =
+  | "allow-skipped"
+  | "require-verification";
+export type RunVaultPolicyProfileName = "standard" | "strict";
+
+export interface RunVaultPolicySnapshot {
+  version: 1;
+  profile: RunVaultPolicyProfileName;
+  capturedAt: string;
+  protectedPatterns: string[];
+  maxChangedFiles: number;
+  maxDeletedFiles: number;
+  maxChangedBytes: number;
+  verificationMode: RunVaultVerificationMode;
+  stagingPerRunBytes: number;
+  stagingTotalBytes: number;
+  quarantineRetentionMs: number;
+  runtime: {
+    agentTimeoutMs: number;
+    verificationTimeoutMs: number;
+    containerCpuLimit: number;
+    containerMemoryLimit: string;
+    containerPidsLimit: number;
+  };
+}
 
 export interface RunVaultFileChange {
   path: string;
@@ -41,13 +76,17 @@ export interface RunVaultChangeSummary {
   protectedPathsTouched: string[];
   files: RunVaultFileChange[];
   omittedFileCount: number;
+  changedBytes: number;
 }
 
 export type RunVaultFindingCode =
   | "execution_cancelled" | "execution_timed_out" | "execution_failed"
   | "verification_failed" | "trusted_workspace_changed" | "unsafe_link"
   | "protected_path" | "dependency_change" | "unsafe_file"
-  | "change_limit_exceeded" | "deletion_limit_exceeded";
+  | "change_limit_exceeded" | "deletion_limit_exceeded"
+  | "verification_required" | "change_bytes_exceeded"
+  | "verification_unavailable" | "staging_quota_exceeded"
+  | "retention_expired";
 
 export interface RunVaultFinding {
   code: RunVaultFindingCode;
@@ -76,6 +115,9 @@ export interface RunVaultDecision {
   findings: RunVaultFinding[];
   verification: RunVaultVerification;
   trustedWorkspaceChanged: boolean;
+  policy: RunVaultPolicySnapshot;
+  retainedAt: string | null;
+  expiresAt: string | null;
   decidedAt: string;
 }
 

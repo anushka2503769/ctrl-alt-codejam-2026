@@ -273,6 +273,17 @@ cp deploy/volcengine/terraform.tfvars.example \
 | `CONTAINER_RUNTIME_IMAGE` | `volc-agent-runtime:local` | Prebuilt image used for Agent and verification containers. |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | Codex inner sandbox mode. |
 | `CODEX_TIMEOUT_MS` | `600000` | Maximum duration of one turn. |
+| `VERIFICATION_TIMEOUT_MS` | `120000` | Maximum duration of the isolated verification command. |
+| `RUNVAULT_POLICY_PROFILE` | `standard` | `strict` lowers limits and requires verification to pass. |
+| `RUNVAULT_PROTECTED_PATTERNS` | `[]` | JSON array of additional relative glob patterns; built-in protections cannot be removed. |
+| `RUNVAULT_MAX_CHANGED_FILES` | Profile default | Optional changed-file limit override. |
+| `RUNVAULT_MAX_DELETED_FILES` | Profile default | Optional deletion limit override. |
+| `RUNVAULT_MAX_CHANGED_BYTES` | Profile default | Optional conservative changed-byte limit override. |
+| `RUNVAULT_VERIFICATION_MODE` | Profile default | `allow-skipped` or `require-verification`. |
+| `RUNVAULT_STAGING_PER_RUN_BYTES` | Profile default | Maximum bytes retained by one staging workspace. |
+| `RUNVAULT_STAGING_TOTAL_BYTES` | Profile default | Maximum bytes across managed staging. |
+| `RUNVAULT_QUARANTINE_RETENTION_MS` | Profile default | Time before quarantined staging expires and is discarded. |
+| `RUNVAULT_QUOTA_POLL_MS` | `1000` | Interval for checking staging growth during Agent execution. |
 | `LOCAL_POC_DATA_ROOT` | Platform-specific | Local metadata, workspace, and session directory. |
 
 See [.env.example](.env.example) for all Runtime and resource-limit options.
@@ -302,6 +313,15 @@ RunVault's deliberate guarantee is:
 
 > An Agent cannot write directly to the trusted workspace; only RunVault's
 > inspected promotion path can change it.
+
+Each Run records the complete immutable policy snapshot that governed it,
+including protected patterns, change and byte limits, verification mode,
+staging quotas, retention, and Runtime limits. The `standard` profile allows a
+missing test script; `strict` requires verification to pass. Failed,
+unavailable, and skipped verification remain distinct evidence states.
+Quarantined staging is assigned `retainedAt` and `expiresAt`; expiry preserves
+redacted decision evidence, marks the Run expired, removes staging, and never
+commits its provisional Codex thread.
 
 Deleting an Agent archives its workspace under `workspaces/.deleted/`.
 

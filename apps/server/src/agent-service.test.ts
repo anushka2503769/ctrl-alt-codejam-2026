@@ -69,6 +69,41 @@ class BlockingFinalizeWorkspaceManager extends RunVaultWorkspaceManager {
   }
 }
 
+class BlockingBeginPromotionWorkspaceManager extends RunVaultWorkspaceManager {
+  private signalBeginStarted!: () => void;
+  private allowBeginToContinue!: () => void;
+  readonly beginStarted: Promise<void>;
+  private readonly beginAllowed: Promise<void>;
+
+  constructor(workspaceRoot: string) {
+    super(workspaceRoot);
+    this.beginStarted = new Promise((resolve) => {
+      this.signalBeginStarted = resolve;
+    });
+    this.beginAllowed = new Promise((resolve) => {
+      this.allowBeginToContinue = resolve;
+    });
+  }
+
+  allowBegin(): void {
+    this.allowBeginToContinue();
+  }
+
+  override async beginPromotion(
+    id: string,
+    trustedWorkspacePath: string,
+    expectedTrustedFingerprint: string,
+  ): Promise<RunVaultPromotion> {
+    this.signalBeginStarted();
+    await this.beginAllowed;
+    return super.beginPromotion(
+      id,
+      trustedWorkspacePath,
+      expectedTrustedFingerprint,
+    );
+  }
+}
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -86,6 +121,7 @@ async function makeServiceHarness(
     (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
   verifier?: RunVaultVerifier,
   dependencies?: DependencyManager,
+  environment: NodeJS.ProcessEnv = {},
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
@@ -98,6 +134,7 @@ async function makeServiceHarness(
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
     VERIFICATION_PROVIDER: "host",
+    ...environment,
   });
   const store = new JsonStore(path.join(root, "data", "db.json"));
   const workspaces = new WorkspaceManager(workspaceRoot);
@@ -361,8 +398,9 @@ describe("Agent lifecycle", () => {
     expect(verify).not.toHaveBeenCalled();
     expect(harness.service.getRun(run.id).runVault).toMatchObject({
       outcome: "quarantined",
+      reason: "dependency_change",
       verification: {
-        status: "skipped",
+        status: "unavailable",
         redactedSummary: expect.stringContaining("stale dependencies"),
       },
     });
@@ -1520,5 +1558,190 @@ describe("Agent lifecycle", () => {
 
     finish({ output: "done", threadId: "thread", usage: null });
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+
+  it("captures an immutable strict policy snapshot for each Run", async () => {
+    let runnerStarted!: () => void;
+    let finishRunner!: () => void;
+    const started = new Promise<void>((resolve) => {
+      runnerStarted = resolve;
+    });
+    const finish = new Promise<void>((resolve) => {
+      finishRunner = resolve;
+    });
+    const runner: AgentRunner = {
+      run: async (request) => {
+        runnerStarted();
+        await finish;
+        await writeFile(path.join(request.workspacePath, "safe.ts"), "safe\n");
+        return { output: "safe change", threadId: "strict-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const harness = await makeServiceHarness(
+      runner,
+      undefined,
+      undefined,
+      undefined,
+      { RUNVAULT_POLICY_PROFILE: "strict" },
+    );
+    const agent = await harness.service.createAgent({ name: "Strict policy" });
+    const { run } = await harness.service.sendMessage(agent.id, "change safely");
+    await started;
+
+    harness.config.runVaultPolicy.profile = "standard";
+    harness.config.runVaultPolicy.verificationMode = "allow-skipped";
+    finishRunner();
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    expect(harness.service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "verification_required",
+      verification: { status: "skipped" },
+      policy: {
+        profile: "strict",
+        verificationMode: "require-verification",
+        capturedAt: run.createdAt,
+      },
+      retainedAt: expect.any(String),
+      expiresAt: expect.any(String),
+    });
+    harness.service.shutdown();
+  });
+
+  it("discards staging growth that exceeds the per-Run quota", async () => {
+    const run = vi.fn(async (request: RunnerRequest) => {
+      await writeFile(
+        path.join(request.workspacePath, "oversized.bin"),
+        Buffer.alloc(1_048_577),
+      );
+      return { output: "large output", threadId: "quota-thread", usage: null };
+    });
+    const harness = await makeServiceHarness(
+      { run, cancel: async () => false, isAvailable: async () => true },
+      undefined,
+      undefined,
+      undefined,
+      {
+        RUNVAULT_MAX_CHANGED_BYTES: "1048576",
+        RUNVAULT_STAGING_PER_RUN_BYTES: "1048576",
+        RUNVAULT_STAGING_TOTAL_BYTES: "2097152",
+        RUNVAULT_QUOTA_POLL_MS: "100",
+      },
+    );
+    const agent = await harness.service.createAgent({ name: "Quota test" });
+    const { run: created } = await harness.service.sendMessage(agent.id, "grow");
+    await expect.poll(() => harness.service.getRun(created.id).status).toBe("failed");
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(harness.service.getRun(created.id).runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "staging_quota_exceeded",
+      findings: expect.arrayContaining([
+        expect.objectContaining({ code: "staging_quota_exceeded" }),
+      ]),
+      policy: { stagingPerRunBytes: 1_048_576 },
+    });
+    await expect(lstat(path.join(agent.workspacePath, "oversized.bin"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    await expect(lstat(harness.runVaultWorkspaces.stagingPath(created.id))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    harness.service.shutdown();
+  });
+
+  it("expires quarantine idempotently without advancing its thread", async () => {
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, ".env"), "SECRET=value\n");
+        return { output: "changed env", threadId: "expired-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const harness = await makeServiceHarness(
+      runner,
+      undefined,
+      undefined,
+      undefined,
+      { RUNVAULT_QUARANTINE_RETENTION_MS: "60000" },
+    );
+    const agent = await harness.service.createAgent({ name: "Expiry test" });
+    const { run } = await harness.service.sendMessage(agent.id, "change env");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+    const quarantined = harness.service.getRun(run.id).runVault!;
+    expect(quarantined).toMatchObject({
+      outcome: "quarantined",
+      retainedAt: expect.any(String),
+      expiresAt: expect.any(String),
+    });
+
+    const expiry = Date.parse(quarantined.expiresAt!);
+    await expect(harness.service.sweepExpiredQuarantines(expiry + 1)).resolves.toBe(1);
+    await expect(harness.service.sweepExpiredQuarantines(expiry + 2)).resolves.toBe(0);
+
+    const expired = harness.service.getRun(run.id);
+    expect(expired.runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "retention_expired",
+      resolution: "expired",
+      provisionalThreadId: "expired-thread",
+      findings: expect.arrayContaining([
+        expect.objectContaining({ code: "retention_expired" }),
+      ]),
+    });
+    expect(JSON.stringify(expired.runVault)).not.toContain("SECRET=value");
+    expect(harness.service.getAgent(agent.id).codexThreadId).toBeNull();
+    await expect(lstat(harness.runVaultWorkspaces.stagingPath(run.id))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    await expect(harness.service.approveRun(run.id)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(harness.service.requestRevision(run.id, "try again")).rejects
+      .toMatchObject({ statusCode: 409 });
+    harness.service.shutdown();
+  });
+
+  it("does not expire a quarantine while approval owns the Agent reservation", async () => {
+    let runVaultWorkspaces!: BlockingBeginPromotionWorkspaceManager;
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, ".env"), "protected\n");
+        return { output: "review me", threadId: "approved-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const harness = await makeServiceHarness(
+      runner,
+      (workspaceRoot) => {
+        runVaultWorkspaces = new BlockingBeginPromotionWorkspaceManager(
+          workspaceRoot,
+        );
+        return runVaultWorkspaces;
+      },
+      undefined,
+      undefined,
+      { RUNVAULT_QUARANTINE_RETENTION_MS: "60000" },
+    );
+    const agent = await harness.service.createAgent({ name: "Approval race" });
+    const { run } = await harness.service.sendMessage(agent.id, "change env");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+    const expiresAt = Date.parse(harness.service.getRun(run.id).runVault!.expiresAt!);
+
+    const approval = harness.service.approveRun(run.id);
+    await runVaultWorkspaces.beginStarted;
+    await expect(harness.service.sweepExpiredQuarantines(expiresAt + 1))
+      .resolves.toBe(0);
+    expect(harness.service.getRun(run.id).runVault?.outcome).toBe("quarantined");
+
+    runVaultWorkspaces.allowBegin();
+    await expect(approval).resolves.toMatchObject({
+      runVault: { outcome: "promoted", resolution: "human_approved" },
+    });
+    await expect(harness.service.sweepExpiredQuarantines(expiresAt + 2))
+      .resolves.toBe(0);
+    expect(harness.service.getAgent(agent.id).codexThreadId).toBe("approved-thread");
+    harness.service.shutdown();
   });
 });

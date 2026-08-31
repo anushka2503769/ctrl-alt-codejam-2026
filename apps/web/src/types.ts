@@ -12,12 +12,18 @@ export type RunVaultReason =
   | "timed_out"
   | "unsafe_file"
   | "unsafe_link"
-  | "trusted_workspace_changed";
+  | "trusted_workspace_changed"
+  | "verification_required"
+  | "verification_unavailable"
+  | "change_bytes_exceeded"
+  | "staging_quota_exceeded"
+  | "retention_expired";
 export type RunVaultResolution =
   | "policy"
   | "human_approved"
-  | "human_discarded";
-export type RunVaultVerificationStatus = "passed" | "failed" | "skipped";
+  | "human_discarded"
+  | "expired";
+export type RunVaultVerificationStatus = "passed" | "failed" | "skipped" | "unavailable";
 export type RunVaultFindingCode =
   | "execution_cancelled"
   | "execution_timed_out"
@@ -29,7 +35,12 @@ export type RunVaultFindingCode =
   | "dependency_change"
   | "unsafe_file"
   | "change_limit_exceeded"
-  | "deletion_limit_exceeded";
+  | "deletion_limit_exceeded"
+  | "verification_required"
+  | "verification_unavailable"
+  | "change_bytes_exceeded"
+  | "staging_quota_exceeded"
+  | "retention_expired";
 export type RunVaultChangeKind = "added" | "modified" | "deleted";
 
 export interface RunVaultFileChange {
@@ -88,10 +99,33 @@ export interface RunVaultDecision {
     protectedPathsTouched: string[];
     files: RunVaultFileChange[];
     omittedFileCount: number;
+    changedBytes: number;
   };
   findings: RunVaultFinding[];
   verification: RunVaultVerification;
   trustedWorkspaceChanged: boolean;
+  policy: {
+    version: 1;
+    profile: "standard" | "strict";
+    capturedAt: string;
+    protectedPatterns: string[];
+    maxChangedFiles: number;
+    maxDeletedFiles: number;
+    maxChangedBytes: number;
+    verificationMode: "allow-skipped" | "require-verification";
+    stagingPerRunBytes: number;
+    stagingTotalBytes: number;
+    quarantineRetentionMs: number;
+    runtime: {
+      agentTimeoutMs: number;
+      verificationTimeoutMs: number;
+      containerCpuLimit: number;
+      containerMemoryLimit: string;
+      containerPidsLimit: number;
+    };
+  };
+  retainedAt: string | null;
+  expiresAt: string | null;
   decidedAt: string;
 }
 
@@ -156,6 +190,8 @@ export interface SystemInfo {
   arkModel: string | null;
   codexAvailable: boolean;
   codexSandboxMode: string;
+  dependencyMode: "disabled" | "existing-cache" | "isolated-ci";
+  runVaultPolicy: RunVaultDecision["policy"];
   runtimeProvider: "local-process" | "container";
   containerEngine: string | null;
   runtime: string;
