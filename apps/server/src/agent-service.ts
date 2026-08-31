@@ -1940,7 +1940,7 @@ export class AgentService {
       await this.runner.cancel(agentId);
       const execution = this.activeExecutions.get(agentId);
       if (execution) {
-        await execution;
+        await execution.catch(() => undefined);
       }
     } finally {
       this.cancellationRequests.delete(agentId);

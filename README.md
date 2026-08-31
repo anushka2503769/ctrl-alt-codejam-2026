@@ -369,6 +369,12 @@ terraform fmt -check -recursive deploy/volcengine
 docker compose config
 ```
 
+For the complete adversarial, recovery, performance, container-isolation, and
+25-pass stress matrix, run `npm run release-gate`. It requires Terraform,
+Docker Compose, a running Docker daemon, and the prebuilt local Runtime image;
+the script does not install dependencies or pull images. See the
+[release-gate evidence matrix](docs/RELEASE_GATE.md).
+
 The automated workspace safety corpus covers safe source and documentation
 changes, protected and secret-like paths, dependency files, change limits,
 verification failures, runner failures, cancellation, timeout, approval,

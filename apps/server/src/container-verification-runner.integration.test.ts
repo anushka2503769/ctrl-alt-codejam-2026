@@ -34,6 +34,7 @@ describe.skipIf(!enabled)("container verification integration", () => {
     const script = [
       "const fs=require('fs');",
       "if (process.env.ARK_API_KEY||process.env.APP_AUTH_TOKEN||process.env.CODEX_HOME||process.env.DOCKER_HOST) process.exit(2);",
+      "console.log('API_TOKEN=literal-container-secret');",
       "try{fs.writeFileSync('/runvault-outside-marker','escape');process.exit(4)}catch{}",
       "fetch('https://example.com', { signal: AbortSignal.timeout(2000) })",
       ".then(() => process.exit(3))",
@@ -63,6 +64,8 @@ describe.skipIf(!enabled)("container verification integration", () => {
       exitCode: 0,
     });
     expect(result.redactedSummary).not.toContain("server-secret-must-not-enter");
+    expect(result.redactedSummary).not.toContain("literal-container-secret");
+    expect(result.redactedSummary).toContain("API_TOKEN=[REDACTED]");
     await expect(
       readFile(path.join(workspace, "verification-marker"), "utf8"),
     ).resolves.toBe("isolated");
@@ -77,7 +80,9 @@ describe.skipIf(!enabled)("container verification integration", () => {
     await writeFile(
       path.join(workspace, "package.json"),
       JSON.stringify({
-        scripts: { test: `node -e "setInterval(() => {}, 1000)"` },
+        scripts: {
+          test: `node -e "process.on('SIGTERM',()=>{});setInterval(() => {}, 1000)"`,
+        },
       }),
     );
     const config = loadConfig({
@@ -102,6 +107,50 @@ describe.skipIf(!enabled)("container verification integration", () => {
         verificationContainerName(workspace, config.runtimeInstanceId),
       ]),
     ).rejects.toBeDefined();
+  }, 20_000);
+
+  it("contains a process storm within the configured PID limit", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "runvault-container-pids-"));
+    temporaryDirectories.push(root);
+    const workspace = path.join(root, ".staging", "run");
+    await mkdir(workspace, { recursive: true });
+    await chmod(workspace, 0o777);
+    const script = [
+      "const cp=require('child_process'),fs=require('fs');",
+      "let blocked=0;const children=[];",
+      "for(let i=0;i<64;i++){",
+      "const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)']);",
+      "child.on('error',()=>blocked++);children.push(child);}",
+      "setTimeout(()=>{",
+      "for(const child of children){try{child.kill('SIGKILL')}catch{}}",
+      "if(blocked===0)process.exit(2);",
+      "fs.writeFileSync('pids-marker',String(blocked));process.exit(0);",
+      "},1500);",
+    ].join("");
+    await writeFile(
+      path.join(workspace, "package.json"),
+      JSON.stringify({ scripts: { test: `node -e ${JSON.stringify(script)}` } }),
+    );
+    const config = loadConfig({
+      NODE_ENV: "test",
+      AGENT_WORKSPACE_ROOT: root,
+      CONTAINER_ENGINE: "docker",
+      CONTAINER_RUNTIME_IMAGE: "volc-agent-runtime:local",
+      CONTAINER_PIDS_LIMIT: "32",
+    });
+    const verifier = new RunVaultVerifier({
+      timeoutMs: 10_000,
+      runner: new ContainerVerificationRunner(config),
+    });
+
+    const result = await verifier.verify(workspace);
+
+    expect(result, result.redactedSummary).toMatchObject({
+      status: "passed",
+      exitCode: 0,
+    });
+    expect(Number(await readFile(path.join(workspace, "pids-marker"), "utf8")))
+      .toBeGreaterThan(0);
   }, 20_000);
 
   it("force-removes a verification container after its time limit", async () => {

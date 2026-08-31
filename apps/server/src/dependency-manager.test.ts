@@ -128,6 +128,13 @@ describe("DependencyManager", () => {
       activePreparations: 0,
       totalBytes: expect.any(Number),
     });
+    await expect(
+      fixture.manager.prepare(fixture.workspace, true),
+    ).resolves.toEqual({
+      status: "already_available",
+      cacheKey: first.cacheKey,
+    });
+    expect(fixture.prepare).toHaveBeenCalledTimes(1);
   });
 
   it("invalidates the cache key when the lockfile changes", async () => {

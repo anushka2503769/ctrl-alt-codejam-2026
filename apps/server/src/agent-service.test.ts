@@ -765,14 +765,21 @@ describe("Agent lifecycle", () => {
 
   it("quarantines a secret-like file without persisting its contents", async () => {
     const secret = "RUNVAULT_TEST_SECRET=never-expose-this-value\n";
-    const service = await makeService({
-      run: async (request) => {
-        await writeFile(path.join(request.workspacePath, ".env"), secret);
-        return { output: "Prepared local config", threadId: "secret-thread", usage: null };
+    const harness = await makeServiceHarness(
+      {
+        run: async (request) => {
+          await writeFile(path.join(request.workspacePath, ".env"), secret);
+          return {
+            output: "Prepared local config",
+            threadId: "secret-thread",
+            usage: null,
+          };
+        },
+        cancel: async () => false,
+        isAvailable: async () => true,
       },
-      cancel: async () => false,
-      isAvailable: async () => true,
-    });
+    );
+    const service = harness.service;
     const agent = await service.createAgent({ name: "Secret-aware builder" });
     const before = await trustedFingerprint(agent.workspacePath);
 
@@ -796,6 +803,12 @@ describe("Agent lifecycle", () => {
       status: "skipped",
       command: null,
     });
+    expect(
+      await readFile(path.join(harness.root, "data", "db.json"), "utf8"),
+    ).not.toContain(secret.trim());
+    expect(JSON.stringify(await service.getRunVaultReview(run.id))).not.toContain(
+      secret.trim(),
+    );
     expect(await trustedFingerprint(agent.workspacePath)).toBe(before);
     await expect(lstat(path.join(agent.workspacePath, ".env"))).rejects
       .toMatchObject({ code: "ENOENT" });
@@ -1110,6 +1123,84 @@ describe("Agent lifecycle", () => {
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("promotes only the final Run in a three-generation revision lineage", async () => {
+    let call = 0;
+    const baseThreads: Array<string | null> = [];
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        baseThreads.push(request.threadId);
+        if (call === 1) {
+          await mkdir(path.join(request.workspacePath, "deploy"));
+          await writeFile(
+            path.join(request.workspacePath, "deploy", "first.yml"),
+            "first risk\n",
+          );
+          return { output: "First proposal", threadId: "lineage-1", usage: null };
+        }
+        if (call === 2) {
+          await writeFile(
+            path.join(request.workspacePath, "deploy", "second.yml"),
+            "second risk\n",
+          );
+          return { output: "Second proposal", threadId: "lineage-2", usage: null };
+        }
+        const { rm } = await import("node:fs/promises");
+        await rm(path.join(request.workspacePath, "deploy"), { recursive: true });
+        await mkdir(path.join(request.workspacePath, "src"));
+        await writeFile(
+          path.join(request.workspacePath, "src", "final.ts"),
+          "export const final = true;\n",
+        );
+        return { output: "Final proposal", threadId: "lineage-3", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Lineage builder" });
+    const { run: rootRun } = await service.sendMessage(agent.id, "first proposal");
+    await expect.poll(() => service.getRun(rootRun.id).status).toBe("completed");
+    const { run: childRun } = await service.requestRevision(
+      rootRun.id,
+      "try a second proposal",
+    );
+    await expect.poll(() => service.getRun(childRun.id).status).toBe("completed");
+    const { run: grandchildRun } = await service.requestRevision(
+      childRun.id,
+      "remove all deployment changes",
+    );
+    await expect.poll(() => service.getRun(grandchildRun.id).status).toBe("completed");
+
+    expect(baseThreads).toEqual([null, "lineage-1", "lineage-2"]);
+    expect(service.getRun(rootRun.id)).toMatchObject({
+      parentRunId: null,
+      supersededByRunId: childRun.id,
+      revisionNumber: 0,
+      runVault: { outcome: "quarantined" },
+    });
+    expect(service.getRun(childRun.id)).toMatchObject({
+      parentRunId: rootRun.id,
+      supersededByRunId: grandchildRun.id,
+      revisionNumber: 1,
+      runVault: { outcome: "quarantined" },
+    });
+    expect(service.getRun(grandchildRun.id)).toMatchObject({
+      parentRunId: childRun.id,
+      supersededByRunId: null,
+      revisionNumber: 2,
+      runVault: { outcome: "promoted" },
+    });
+    expect(
+      service.getRunVaultHistory({ lineageRunId: childRun.id }).map((run) => run.id),
+    ).toEqual([grandchildRun.id, childRun.id, rootRun.id]);
+    expect(service.getAgent(agent.id).codexThreadId).toBe("lineage-3");
+    await expect(
+      readFile(path.join(agent.workspacePath, "src", "final.ts"), "utf8"),
+    ).resolves.toBe("export const final = true;\n");
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
   it("keeps parent evidence and staging when a revision fails", async () => {
     let call = 0;
     const service = await makeService({
@@ -1142,6 +1233,48 @@ describe("Agent lifecycle", () => {
     await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("keeps the committed thread unchanged when a revision is cancelled", async () => {
+    let call = 0;
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        if (call === 1) {
+          await mkdir(path.join(request.workspacePath, "deploy"));
+          await writeFile(
+            path.join(request.workspacePath, "deploy", "app.yml"),
+            "risk\n",
+          );
+          return { output: "Parent proposal", threadId: "cancel-parent", usage: null };
+        }
+        await writeFile(path.join(request.workspacePath, "partial.txt"), "partial\n");
+        throw new RunCancelledError();
+      },
+      cancel: async () => true,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Cancelled revision" });
+    const { run: parent } = await service.sendMessage(agent.id, "prepare risk");
+    await expect.poll(() => service.getRun(parent.id).status).toBe("completed");
+    const parentFingerprint = await trustedFingerprint(agent.workspacePath);
+
+    const { run: child } = await service.requestRevision(parent.id, "cancel revision");
+    await expect.poll(() => service.getRun(child.id).status).toBe("cancelled");
+
+    expect(service.getRun(parent.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      provisionalThreadId: "cancel-parent",
+    });
+    expect(service.getRun(child.id)).toMatchObject({
+      parentRunId: parent.id,
+      status: "cancelled",
+      runVault: { outcome: "discarded", reason: "cancelled" },
+    });
+    expect(service.getAgent(agent.id).codexThreadId).toBeNull();
+    expect(await trustedFingerprint(agent.workspacePath)).toBe(parentFingerprint);
+    await expect(lstat(path.join(agent.workspacePath, "partial.txt"))).rejects
+      .toMatchObject({ code: "ENOENT" });
   });
 
   it("discards quarantined work idempotently without committing its thread", async () => {
@@ -1820,6 +1953,18 @@ describe("Agent lifecycle", () => {
 
     const approval = harness.service.approveRun(run.id);
     await runVaultWorkspaces.beginStarted;
+    const competingActions = await Promise.allSettled([
+      harness.service.approveRun(run.id),
+      harness.service.discardRun(run.id),
+      harness.service.requestRevision(run.id, "competing revision"),
+    ]);
+    expect(competingActions).toHaveLength(3);
+    for (const action of competingActions) {
+      expect(action).toMatchObject({
+        status: "rejected",
+        reason: { statusCode: 409 },
+      });
+    }
     await expect(harness.service.sweepExpiredQuarantines(expiresAt + 1))
       .resolves.toBe(0);
     expect(harness.service.getRun(run.id).runVault?.outcome).toBe("quarantined");
@@ -1835,4 +1980,50 @@ describe("Agent lifecycle", () => {
     expect(harness.service.getAgent(agent.id).codexThreadId).toBe("approved-thread");
     harness.service.shutdown();
   });
+
+  it("lets Agent deletion cancel an in-flight approval without promoting work", async () => {
+    let runVaultWorkspaces!: BlockingBeginPromotionWorkspaceManager;
+    const harness = await makeServiceHarness(
+      {
+        run: async (request) => {
+          await writeFile(path.join(request.workspacePath, ".env"), "delete race\n");
+          return { output: "review me", threadId: "deleted-approval", usage: null };
+        },
+        cancel: async () => false,
+        isAvailable: async () => true,
+      },
+      (workspaceRoot) => {
+        runVaultWorkspaces = new BlockingBeginPromotionWorkspaceManager(
+          workspaceRoot,
+        );
+        return runVaultWorkspaces;
+      },
+    );
+    const agent = await harness.service.createAgent({ name: "Deletion race" });
+    await writeFile(path.join(agent.workspacePath, "trusted.txt"), "trusted\n");
+    const trustedBefore = await trustedFingerprint(agent.workspacePath);
+    const { run } = await harness.service.sendMessage(agent.id, "change env");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+    const stagingPath = harness.runVaultWorkspaces.stagingPath(run.id);
+
+    const approval = harness.service.approveRun(run.id);
+    await runVaultWorkspaces.beginStarted;
+    const approvalResult = expect(approval).rejects.toMatchObject({
+      statusCode: 409,
+      message: "Run approval was cancelled",
+    });
+    const deletion = harness.service.deleteAgent(agent.id);
+    runVaultWorkspaces.allowBegin();
+
+    await approvalResult;
+    const { archivedWorkspace } = await deletion;
+    expect(await trustedFingerprint(archivedWorkspace)).toBe(trustedBefore);
+    await expect(readFile(path.join(archivedWorkspace, "trusted.txt"), "utf8"))
+      .resolves.toBe("trusted\n");
+    await expect(lstat(path.join(archivedWorkspace, ".env"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    await expect(lstat(stagingPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(() => harness.service.getAgent(agent.id)).toThrow("Agent not found");
+    harness.service.shutdown();
+  }, 10_000);
 });

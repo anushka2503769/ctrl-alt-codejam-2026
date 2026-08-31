@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import {
   chmod,
   lstat,
@@ -11,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Database, RunVaultOutcome } from "./types.js";
 import {
@@ -24,6 +26,7 @@ import {
 let root: string;
 let trusted: string;
 let manager: RunVaultWorkspaceManager;
+const execFileAsync = promisify(execFile);
 
 beforeEach(async () => {
   root = await mkdtemp(path.join(tmpdir(), "runvault-workspace-test-"));
@@ -137,6 +140,19 @@ describe("RunVaultWorkspaceManager", () => {
       path.join(trusted, "node_modules", "large-package", "index.js"),
       "x".repeat(4096),
     );
+    await Promise.all(
+      Array.from({ length: 256 }, (_, index) =>
+        writeFile(
+          path.join(
+            trusted,
+            "node_modules",
+            "large-package",
+            `generated-${index}.js`,
+          ),
+          `module.exports = ${index};\n`,
+        ),
+      ),
+    );
     await mkdir(path.join(trusted, "packages", "nested", "node_modules"), {
       recursive: true,
     });
@@ -156,6 +172,9 @@ describe("RunVaultWorkspaceManager", () => {
       "node_modules",
       "packages/nested/node_modules",
     ]);
+    expect(before.entryCount).toBeLessThan(10);
+    expect(staging.metrics.copiedEntryCount).toBe(before.entryCount);
+    expect(staging.metrics.estimatedCopiedBytes).toBe(before.estimatedBytes);
     await expect(lstat(path.join(staging.path, "node_modules"))).rejects.toMatchObject({
       code: "ENOENT",
     });
@@ -639,6 +658,66 @@ describe("RunVaultWorkspaceManager", () => {
     );
     await expect(readFile(path.join(trusted, "state.txt"), "utf8")).resolves
       .toBe("staged\n");
+  });
+
+  it("keeps a real Git repository functional after promotion and restart recovery", async () => {
+    const git = (...args: string[]) =>
+      execFileAsync("git", args, { cwd: trusted });
+    await git("init");
+    await git("config", "user.name", "RunVault Test");
+    await git("config", "user.email", "runvault@example.invalid");
+    await writeFile(path.join(trusted, "source.ts"), "export const value = 1;\n");
+    await mkdir(path.join(trusted, "fixtures"));
+    await Promise.all(
+      Array.from({ length: 64 }, (_, index) =>
+        writeFile(
+          path.join(trusted, "fixtures", `fixture-${index}.txt`),
+          `fixture ${index}\n`,
+        ),
+      ),
+    );
+    await git("add", ".");
+    await git("commit", "-m", "initial fixture");
+    const head = (await git("rev-parse", "HEAD")).stdout.trim();
+    const looseObjects = Number(
+      /^count: (\d+)$/m.exec((await git("count-objects", "-v")).stdout)?.[1] ?? 0,
+    );
+    expect(looseObjects).toBeGreaterThan(50);
+
+    const first = await stage("run-real-git-promotion");
+    await writeFile(path.join(first.path, "source.ts"), "export const value = 2;\n");
+    const firstPromotion = await manager.beginPromotion(
+      first.id,
+      trusted,
+      first.trustedSnapshot.fingerprint,
+    );
+    await manager.finalizePromotion(firstPromotion);
+
+    expect((await git("rev-parse", "HEAD")).stdout.trim()).toBe(head);
+    expect((await git("status", "--porcelain")).stdout).toContain("M source.ts");
+    await expect(git("fsck", "--no-dangling")).resolves.toBeDefined();
+
+    const second = await stage("run-real-git-recovery");
+    await writeFile(path.join(second.path, "source.ts"), "export const value = 3;\n");
+    await manager.beginPromotion(
+      second.id,
+      trusted,
+      second.trustedSnapshot.fingerprint,
+    );
+    const restarted = new RunVaultWorkspaceManager(root);
+    const reconciliation = await restarted.reconcileTransactions(
+      databaseForRun(second.id, "promoted"),
+    );
+
+    expect(reconciliation.records).toEqual([
+      { runId: second.id, action: "completed_promotion" },
+    ]);
+    expect((await git("rev-parse", "HEAD")).stdout.trim()).toBe(head);
+    expect((await git("status", "--porcelain")).stdout).toContain("M source.ts");
+    await expect(git("fsck", "--no-dangling")).resolves.toBeDefined();
+    await expect(
+      readFile(path.join(trusted, "source.ts"), "utf8"),
+    ).resolves.toBe("export const value = 3;\n");
   });
 
   it("preserves root and nested trusted dependency metadata through promotion", async () => {
