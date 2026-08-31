@@ -22,6 +22,50 @@ const updateAgentBody = createAgentBody.partial().refine(
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
 });
+const reviewDiffQuery = z.object({ path: z.string().min(1).max(500) });
+const revisionBody = z.object({
+  instructions: z.string().trim().min(1).max(50_000),
+});
+const dependencyPreparationBody = z.object({
+  confirmNetworkAccess: z.literal(true),
+});
+const runHistoryQuery = z
+  .object({
+    agentId: z.string().uuid().optional(),
+    outcome: z.enum(["promoted", "quarantined", "discarded"]).optional(),
+    finding: z
+      .enum([
+        "execution_cancelled",
+        "execution_timed_out",
+        "execution_failed",
+        "verification_failed",
+        "trusted_workspace_changed",
+        "unsafe_link",
+        "protected_path",
+        "dependency_change",
+        "unsafe_file",
+        "change_limit_exceeded",
+        "deletion_limit_exceeded",
+        "verification_required",
+        "change_bytes_exceeded",
+        "verification_unavailable",
+        "staging_quota_exceeded",
+        "retention_expired",
+      ])
+      .optional(),
+    verification: z
+      .enum(["passed", "failed", "skipped", "unavailable"])
+      .optional(),
+    lineage: z.enum(["root", "revision"]).optional(),
+    lineageRunId: z.string().uuid().optional(),
+    from: z.string().datetime({ offset: true }).optional(),
+    to: z.string().datetime({ offset: true }).optional(),
+    limit: z.coerce.number().int().min(1).max(200).optional(),
+  })
+  .refine(
+    (query) => !query.from || !query.to || Date.parse(query.from) <= Date.parse(query.to),
+    "History start date must be before the end date",
+  );
 
 export async function createApp(
   config: AppConfig,
@@ -33,6 +77,9 @@ export async function createApp(
       redact: ["req.headers.authorization", "req.headers.cookie"],
     },
     bodyLimit: 1_048_576,
+  });
+  app.addHook("onClose", async () => {
+    service.shutdown?.();
   });
 
   await app.register(cors, {
@@ -72,6 +119,10 @@ export async function createApp(
 
   app.get("/api/system", async () => service.systemInfo());
 
+  app.get("/api/runvault/diagnostics", async () => ({
+    diagnostics: await service.runVaultDiagnostics(),
+  }));
+
   app.get("/api/agents", async () => ({ agents: service.listAgents() }));
 
   app.post("/api/agents", async (request, reply) => {
@@ -106,6 +157,17 @@ export async function createApp(
     return { agent: await service.stopAgent(id) };
   });
 
+  app.post("/api/agents/:id/dependencies/prepare", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    const body = dependencyPreparationBody.parse(request.body);
+    return {
+      dependencyCache: await service.prepareDependencies(
+        id,
+        body.confirmNetworkAccess,
+      ),
+    };
+  });
+
   app.get("/api/agents/:id/messages", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { messages: service.getMessages(id) };
@@ -123,9 +185,34 @@ export async function createApp(
     return reply.code(202).send(result);
   });
 
+  app.get("/api/runs", async (request) => {
+    const filters = runHistoryQuery.parse(request.query);
+    return { runs: service.getRunVaultHistory(filters) };
+  });
+
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
     return { run: service.getRun(id) };
+  });
+
+  app.get("/api/runs/:id/runvault/evidence", async (request, reply) => {
+    const { id } = runIdParams.parse(request.params);
+    reply.header(
+      "Content-Disposition",
+      `attachment; filename="runvault-evidence-${id}.json"`,
+    );
+    return { evidence: service.getRunVaultEvidence(id) };
+  });
+
+  app.get("/api/runs/:id/runvault/review", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    return { review: await service.getRunVaultReview(id) };
+  });
+
+  app.get("/api/runs/:id/runvault/diff", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    const { path } = reviewDiffQuery.parse(request.query);
+    return { diff: await service.getRunVaultDiff(id, path) };
   });
 
   app.post("/api/runs/:id/approve", async (request) => {
@@ -136,6 +223,12 @@ export async function createApp(
   app.post("/api/runs/:id/discard", async (request) => {
     const { id } = runIdParams.parse(request.params);
     return { run: await service.discardRun(id) };
+  });
+
+  app.post("/api/runs/:id/revisions", async (request, reply) => {
+    const { id } = runIdParams.parse(request.params);
+    const { instructions } = revisionBody.parse(request.body);
+    return reply.code(202).send(await service.requestRevision(id, instructions));
   });
 
   if (config.nodeEnv === "production") {

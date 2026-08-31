@@ -1,4 +1,17 @@
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type {
+  Agent,
+  AgentRun,
+  Message,
+  RunVaultDiagnostics,
+  RunVaultEvidenceExport,
+  RunVaultFindingCode,
+  RunVaultHistoryEntry,
+  RunVaultOutcome,
+  RunVaultReviewEvidence,
+  RunVaultTextDiff,
+  RunVaultVerificationStatus,
+  SystemInfo,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -35,6 +48,8 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 export const api = {
   auth: () => request<{ required: boolean }>("/api/auth"),
   system: () => request<SystemInfo>("/api/system"),
+  runVaultDiagnostics: () =>
+    request<{ diagnostics: RunVaultDiagnostics }>("/api/runvault/diagnostics"),
   listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
   createAgent: (body: {
     name: string;
@@ -69,6 +84,24 @@ export const api = {
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),
   runs: (id: string) =>
     request<{ runs: AgentRun[] }>("/api/agents/" + id + "/runs"),
+  runVaultHistory: (filters: {
+    agentId?: string;
+    outcome?: RunVaultOutcome;
+    finding?: RunVaultFindingCode;
+    verification?: RunVaultVerificationStatus;
+    lineage?: "root" | "revision";
+    lineageRunId?: string;
+    from?: string;
+    to?: string;
+    limit?: number;
+  }) => {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== "") query.set(key, String(value));
+    }
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    return request<{ runs: RunVaultHistoryEntry[] }>(`/api/runs${suffix}`);
+  },
   sendMessage: (id: string, content: string) =>
     request<{ run: AgentRun; message: Message }>(
       "/api/agents/" + id + "/messages",
@@ -78,6 +111,18 @@ export const api = {
       },
     ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+  runVaultReview: (id: string) =>
+    request<{ review: RunVaultReviewEvidence }>(
+      "/api/runs/" + id + "/runvault/review",
+    ),
+  runVaultEvidence: (id: string) =>
+    request<{ evidence: RunVaultEvidenceExport }>(
+      "/api/runs/" + id + "/runvault/evidence",
+    ),
+  runVaultDiff: (id: string, path: string) =>
+    request<{ diff: RunVaultTextDiff }>(
+      "/api/runs/" + id + "/runvault/diff?path=" + encodeURIComponent(path),
+    ),
   approveRun: (id: string) =>
     request<{ run: AgentRun }>("/api/runs/" + id + "/approve", {
       method: "POST",
@@ -86,4 +131,12 @@ export const api = {
     request<{ run: AgentRun }>("/api/runs/" + id + "/discard", {
       method: "POST",
     }),
+  reviseRun: (id: string, instructions: string) =>
+    request<{ run: AgentRun; message: Message }>(
+      "/api/runs/" + id + "/revisions",
+      {
+        method: "POST",
+        body: JSON.stringify({ instructions }),
+      },
+    ),
 };

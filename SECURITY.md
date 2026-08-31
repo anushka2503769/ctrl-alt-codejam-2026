@@ -12,11 +12,43 @@ credentials, personal data, or exploit details in an issue.
 ## Known limitations
 
 - Shared demo token; no user identity, authorization, RBAC, or tenant isolation
+- Run history, lifecycle events, metrics, exports, and diagnostics are stored in
+  the same single-process JSON database. They are not append-only, signed,
+  externally witnessed, tamper-proof, or attributable to individual users.
+- Evidence export omits prompts, Agent output, Run errors, verification output,
+  and absolute workspace paths. It intentionally retains policy metadata and
+  relative changed paths, which may still reveal project structure; review an
+  export before sharing it.
 - No CSRF protection
 - No per-Agent container boundary in ECS mode
 - Ordinary local containers, not hardened multi-tenant sandboxes
-- Repository `npm test` scripts execute code inside the POC Runtime trust
-  boundary; environment scrubbing and output redaction are not a security sandbox.
+- Docker Compose gives the control-plane container access to the host Docker
+  socket. Verification containers never receive that socket or the trusted
+  workspace, but compromise of the control plane remains host-significant.
+- Repository `npm test` scripts execute in a disposable no-network container
+  with dropped capabilities and resource limits. Ordinary containers are still
+  not a hardened multi-tenant sandbox.
+- Trusted `.git` files and directories are not copied or content-hashed.
+  Agent-created `.git` metadata is quarantined and cannot be approved; durable
+  promotion recovery preserves trusted repository metadata separately.
+- `node_modules` is not copied, content-hashed, or promoted as source. Existing
+  trusted trees are preserved but never mounted into Runs. Optional managed
+  caches are content-keyed and mounted read-only; RunVault never automatically
+  installs packages during Agent or verification Runs.
+- `DEPENDENCY_MODE=isolated-ci` exposes an authenticated preparation endpoint.
+  Each request requires an explicit network confirmation and runs constrained
+  `npm ci --ignore-scripts`; registry packages remain untrusted executable code
+  when later imported by an Agent or test process.
+- RunVault enforces configured per-Run and aggregate staging byte limits before
+  copying, during execution, and before promotion. During execution these are
+  application-level periodic measurements, not filesystem or block-device
+  quotas, so a fast writer can temporarily pass the configured threshold before
+  cancellation completes. Keep adequate disk headroom and use host-level disk
+  quotas for stronger exhaustion resistance.
+- Quarantined staging expires under the configured retention policy. Expiry
+  preserves bounded redacted evidence but permanently removes the reviewable
+  staged files; operators should approve, revise, or export anything needed
+  before `expiresAt`.
 - Broad outbound network access
 - Prompt-triggered command and file execution
 - Ark key available to the server and active Runtime container

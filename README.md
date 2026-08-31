@@ -1,8 +1,9 @@
 # RunVault
 
 Transactional workspace middleware for AI coding agents, built on the Volc
-Agent Launchpad baseline. Every Agent Run is staged, inspected, and verified
-before its workspace and Codex thread can become trusted state.
+Agent Launchpad baseline. Every Agent Run is staged and inspected before its
+workspace and Codex thread can become trusted state. When a test script is
+configured and safe to execute, its result is reported separately.
 
 Run it locally with Docker, Colima, or rootless Podman, or deploy it to
 Volcengine ECS.
@@ -26,9 +27,16 @@ Volcengine ECS.
 ## Features
 
 - Transactional staging for every Agent Run
+- Trusted Git metadata excluded from staging and hashing, then preserved across
+  promotion and recovery
 - Deterministic promote, quarantine, and discard policy
-- Verification inside staged workspaces before promotion
-- Redacted Run evidence with protected-path metadata
+- Explicit verification status, with configured tests run in a no-network,
+  resource-limited verification container
+- Focused Run review with findings, file classifications, and safe bounded diffs
+- Revision Runs that continue quarantined proposals without approving the parent
+- Cross-Agent Run history with outcome, finding, verification, lineage, and date filters
+- Redacted JSON evidence export with bounded lifecycle and operational metrics
+- Authenticated staging, dependency-cache, verifier, and cleanup diagnostics
 - Human approval or discard for quarantined work
 - Crash-safe promotion and restart reconciliation
 - Workspace and Codex conversation promoted as one decision
@@ -107,9 +115,10 @@ In the Web UI:
 The Agent can write files and run commands. Later messages fork from the last
 promoted Codex session, keeping discarded or quarantined context provisional.
 
-After each completed Run, inspect the **RunVault decision** panel. Safe,
-verified work is promoted automatically. Risky changes remain isolated and
-offer **Approve and promote** and **Discard staged work** controls.
+After each completed Run, inspect the **RunVault decision** panel. Workspace
+outcome and verification status are shown separately. Policy-compliant work is
+promoted automatically; risky changes remain isolated and offer **Approve and
+promote** and **Discard staged work** controls.
 
 To exercise quarantine deliberately, try:
 
@@ -119,6 +128,57 @@ Update deploy/production.yml with a new production rollout configuration.
 
 RunVault shows the protected path and verification metadata, but never displays
 the protected file's contents in its decision evidence.
+
+Select **Run history** in the sidebar to search decisions across Agents. A
+history result can reopen its exact Agent Run or download a redacted JSON
+evidence file. Exports contain decision metadata, relative changed paths,
+bounded lifecycle events, and numeric metrics; they omit prompts, Agent output,
+Run errors, verification output, secrets, and absolute workspace paths.
+
+The history and diagnostics APIs use the same shared-token protection as the
+rest of the control plane:
+
+```bash
+curl --fail \
+  --header "Authorization: Bearer $APP_AUTH_TOKEN" \
+  "http://127.0.0.1:3000/api/runs?outcome=quarantined&verification=failed"
+
+curl --fail \
+  --header "Authorization: Bearer $APP_AUTH_TOKEN" \
+  "http://127.0.0.1:3000/api/runvault/diagnostics"
+```
+
+History accepts `agentId`, `outcome`, `finding`, `verification`, `lineage`,
+`lineageRunId`, `from`, `to`, and `limit` filters. Evidence is available from
+`GET /api/runs/:id/runvault/evidence`. These records are an operational aid for
+the single-user POC, not a tamper-proof audit log.
+
+### Optional managed npm dependencies
+
+RunVault never copies, hashes, or promotes `node_modules`. Existing trusted
+trees are preserved across workspace swaps for compatibility, but Agent and
+verification containers can access dependencies only through an immutable
+managed cache mounted read-only.
+
+The default `DEPENDENCY_MODE=disabled` performs no dependency preparation. To
+require previously prepared caches, use `existing-cache`. To allow explicit
+preparation, use `isolated-ci` together with container Agent and verification
+providers and a non-empty `APP_AUTH_TOKEN`. Preparation is never automatic: an
+authenticated caller must opt in to network access for one Agent workspace:
+
+```bash
+curl --fail --request POST \
+  --header "Authorization: Bearer $APP_AUTH_TOKEN" \
+  --header "Content-Type: application/json" \
+  --data '{"confirmNetworkAccess":true}' \
+  "http://127.0.0.1:3000/api/agents/AGENT_ID/dependencies/prepare"
+```
+
+That endpoint runs `npm ci --ignore-scripts --no-audit --no-fund` in a
+resource-limited preparation container. RunVault never automatically installs
+packages during Agent Runs, and verification remains offline. Changing
+`package.json` or `package-lock.json`
+changes the cache key; stale dependencies are not reused.
 
 ### 5. Stop and resume
 
@@ -166,8 +226,12 @@ APP_AUTH_TOKEN=replace-with-at-least-24-random-characters
 Start the application:
 
 ```bash
-docker compose up --build
+CONTAINER_ENGINE_BINARY="$(command -v docker)" docker compose up --build
 ```
+
+Compose builds the pinned local verification Runtime before starting the app
+and gives only the control plane access to the host engine. Run containers use
+`--pull never`, so starting a Run never downloads an image.
 
 Open <http://localhost:3000>. Stop it without deleting Agent data:
 
@@ -225,8 +289,27 @@ cp deploy/volcengine/terraform.tfvars.example \
 | `ARK_BASE_URL` | Beijing v3 endpoint | Ark OpenAI-compatible API URL. |
 | `APP_AUTH_TOKEN` | Empty on loopback | Shared demo token; use 24+ random characters remotely. |
 | `RUNTIME_PROVIDER` | `local-process` | `container` for disposable local Runtime containers. |
+| `VERIFICATION_PROVIDER` | `container` | `host` is an explicit development/test-only fallback and is rejected in production. |
+| `VERIFICATION_WORKSPACE_HOST_ROOT` | Workspace root | Host-side workspace path when the server runs inside a container. |
+| `CONTAINER_WORKSPACE_HOST_ROOT` | Workspace root | Host-side staging root used by container Agent Runs. |
+| `CONTAINER_CODEX_HOME_HOST_ROOT` | Codex home | Host-side Codex home used by container Agent Runs. |
+| `DEPENDENCY_MODE` | `disabled` | `existing-cache` requires prepared caches; `isolated-ci` also enables explicit preparation. |
+| `DEPENDENCY_CACHE_ROOT` | Data directory + `dependencies` | Control-plane path for immutable dependency caches. |
+| `DEPENDENCY_CACHE_HOST_ROOT` | Cache root | Host-side cache path used for container mounts. |
+| `CONTAINER_RUNTIME_IMAGE` | `volc-agent-runtime:local` | Prebuilt image used for Agent and verification containers. |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | Codex inner sandbox mode. |
 | `CODEX_TIMEOUT_MS` | `600000` | Maximum duration of one turn. |
+| `VERIFICATION_TIMEOUT_MS` | `120000` | Maximum duration of the isolated verification command. |
+| `RUNVAULT_POLICY_PROFILE` | `standard` | `strict` lowers limits and requires verification to pass. |
+| `RUNVAULT_PROTECTED_PATTERNS` | `[]` | JSON array of additional relative glob patterns; built-in protections cannot be removed. |
+| `RUNVAULT_MAX_CHANGED_FILES` | Profile default | Optional changed-file limit override. |
+| `RUNVAULT_MAX_DELETED_FILES` | Profile default | Optional deletion limit override. |
+| `RUNVAULT_MAX_CHANGED_BYTES` | Profile default | Optional conservative changed-byte limit override. |
+| `RUNVAULT_VERIFICATION_MODE` | Profile default | `allow-skipped` or `require-verification`. |
+| `RUNVAULT_STAGING_PER_RUN_BYTES` | Profile default | Maximum bytes retained by one staging workspace. |
+| `RUNVAULT_STAGING_TOTAL_BYTES` | Profile default | Maximum bytes across managed staging. |
+| `RUNVAULT_QUARANTINE_RETENTION_MS` | Profile default | Time before quarantined staging expires and is discarded. |
+| `RUNVAULT_QUOTA_POLL_MS` | `1000` | Interval for checking staging growth during Agent execution. |
 | `LOCAL_POC_DATA_ROOT` | Platform-specific | Local metadata, workspace, and session directory. |
 
 See [.env.example](.env.example) for all Runtime and resource-limit options.
@@ -254,7 +337,24 @@ and startup reconciliation repairs interrupted transactions.
 
 RunVault's deliberate guarantee is:
 
-> An Agent cannot silently turn unverified work into persistent workspace state.
+> An Agent cannot write directly to the trusted workspace; only RunVault's
+> inspected promotion path can change it.
+
+Each Run records the complete immutable policy snapshot that governed it,
+including protected patterns, change and byte limits, verification mode,
+staging quotas, retention, and Runtime limits. The `standard` profile allows a
+missing test script; `strict` requires verification to pass. Failed,
+unavailable, and skipped verification remain distinct evidence states.
+Quarantined staging is assigned `retainedAt` and `expiresAt`; expiry preserves
+redacted decision evidence, marks the Run expired, removes staging, and never
+commits its provisional Codex thread.
+
+Each Run also retains at most 100 typed lifecycle events and a fixed set of
+timing, size, outcome, verification, and cleanup metrics. Metric events contain
+only Run and Agent IDs, enums, numbers, and timestamps—never prompts, content,
+secrets, or filesystem paths. Authenticated diagnostics report retained staging
+usage, orphan cleanup, dependency-cache state, verifier availability, and
+aggregate persisted metrics.
 
 Deleting an Agent archives its workspace under `workspaces/.deleted/`.
 
@@ -268,6 +368,12 @@ npm run check
 terraform fmt -check -recursive deploy/volcengine
 docker compose config
 ```
+
+For the complete adversarial, recovery, performance, container-isolation, and
+25-pass stress matrix, run `npm run release-gate`. It requires Terraform,
+Docker Compose, a running Docker daemon, and the prebuilt local Runtime image;
+the script does not install dependencies or pull images. See the
+[release-gate evidence matrix](docs/RELEASE_GATE.md).
 
 The automated workspace safety corpus covers safe source and documentation
 changes, protected and secret-like paths, dependency files, change limits,

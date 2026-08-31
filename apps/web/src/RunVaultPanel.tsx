@@ -1,9 +1,12 @@
 import type {
   AgentRun,
-  RunVaultOutcome,
-  RunVaultReason,
-  RunVaultResolution,
 } from "./types";
+import {
+  reasonCopy,
+  resolutionCopy,
+  verificationCopy,
+  workspaceOutcomeCopy,
+} from "./runvault-copy";
 
 export type RunVaultAction = "approve" | "discard";
 
@@ -11,33 +14,8 @@ interface RunVaultPanelProps {
   run: AgentRun;
   action: RunVaultAction | null;
   onAction: (action: RunVaultAction) => void;
+  approvalDisabled?: boolean;
 }
-
-const outcomeLabels: Record<RunVaultOutcome, string> = {
-  promoted: "Promoted",
-  quarantined: "Quarantined",
-  discarded: "Discarded",
-};
-
-const reasonLabels: Record<RunVaultReason, string> = {
-  verified_safe: "Verified changes passed policy",
-  protected_path: "Protected workspace path changed",
-  change_limit_exceeded: "Change limit exceeded",
-  dependency_change: "Dependency configuration changed",
-  verification_failed: "Verification did not pass",
-  run_failed: "Agent execution failed",
-  cancelled: "Run was cancelled",
-  timed_out: "Run timed out",
-  unsafe_file: "Unsafe file type introduced",
-  unsafe_link: "Symbolic link introduced",
-  trusted_workspace_changed: "Trusted workspace changed during the Run",
-};
-
-const resolutionLabels: Record<RunVaultResolution, string> = {
-  policy: "Automatic policy decision",
-  human_approved: "Approved by an operator",
-  human_discarded: "Discarded by an operator",
-};
 
 function fileSummary(run: AgentRun): string {
   const changes = run.runVault?.changedFiles;
@@ -47,17 +25,17 @@ function fileSummary(run: AgentRun): string {
   return `${total} file${total === 1 ? "" : "s"} changed`;
 }
 
-function verificationSummary(run: AgentRun): string {
-  const verification = run.runVault?.verification;
-  if (!verification) return "Not available";
-  const command = verification.command ? `${verification.command} · ` : "";
-  return `${command}${verification.status}`;
-}
-
-export function RunVaultPanel({ run, action, onAction }: RunVaultPanelProps) {
+export function RunVaultPanel({
+  run,
+  action,
+  onAction,
+  approvalDisabled = false,
+}: RunVaultPanelProps) {
   const decision = run.runVault;
   if (!decision) return null;
   const awaitingDecision = decision.outcome === "quarantined";
+  const workspaceCopy = workspaceOutcomeCopy[decision.outcome];
+  const testsCopy = verificationCopy(decision.verification);
 
   return (
     <section
@@ -73,24 +51,39 @@ export function RunVaultPanel({ run, action, onAction }: RunVaultPanelProps) {
             <h3 id={`runvault-title-${run.id}`}>RunVault decision</h3>
           </div>
         </div>
-        <span className={`runvault-outcome outcome-${decision.outcome}`}>
+        <span
+          className={`runvault-outcome outcome-${decision.outcome}`}
+          aria-label={`Workspace outcome: ${workspaceCopy.label}`}
+        >
           <span aria-hidden="true" />
-          {outcomeLabels[decision.outcome]}
+          {workspaceCopy.shortLabel}
         </span>
       </div>
 
       <div className="runvault-reason">
-        <strong>{reasonLabels[decision.reason]}</strong>
-        <span>{resolutionLabels[decision.resolution]}</span>
+        <strong>{reasonCopy[decision.reason]}</strong>
+        <span>{resolutionCopy[decision.resolution]}</span>
+      </div>
+
+      <div className="runvault-status-grid">
+        <section aria-label={`Workspace outcome: ${workspaceCopy.label}`}>
+          <span className="runvault-status-label">Workspace outcome</span>
+          <strong>{workspaceCopy.label}</strong>
+          <p>{workspaceCopy.explanation}</p>
+        </section>
+        <section aria-label={`Verification status: ${testsCopy.label}`}>
+          <span className="runvault-status-label">Verification</span>
+          <strong className={`evidence-${decision.verification.status}`}>
+            {testsCopy.label}
+          </strong>
+          <p>{testsCopy.explanation}</p>
+          {decision.verification.command && (
+            <code>{decision.verification.command}</code>
+          )}
+        </section>
       </div>
 
       <dl className="runvault-evidence">
-        <div>
-          <dt>Verification</dt>
-          <dd className={`evidence-${decision.verification.status}`}>
-            {verificationSummary(run)}
-          </dd>
-        </div>
         <div>
           <dt>Change summary</dt>
           <dd>
@@ -101,9 +94,9 @@ export function RunVaultPanel({ run, action, onAction }: RunVaultPanelProps) {
           </dd>
         </div>
         <div>
-          <dt>Trusted workspace</dt>
+          <dt>Trusted baseline during Run</dt>
           <dd className={decision.trustedWorkspaceChanged ? "evidence-warning" : "evidence-passed"}>
-            {decision.trustedWorkspaceChanged ? "Changed externally" : "Unchanged"}
+            {decision.trustedWorkspaceChanged ? "Changed externally" : "No concurrent change detected"}
           </dd>
         </div>
       </dl>
@@ -145,7 +138,7 @@ export function RunVaultPanel({ run, action, onAction }: RunVaultPanelProps) {
             <button
               type="button"
               className="button runvault-approve"
-              disabled={action !== null}
+              disabled={action !== null || approvalDisabled}
               onClick={() => onAction("approve")}
             >
               {action === "approve" ? "Promoting…" : "Approve and promote"}

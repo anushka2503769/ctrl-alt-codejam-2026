@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import path from "node:path";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
 import { buildCodexArgs, parseCodexEventLine } from "./codex-runner.js";
@@ -35,15 +36,60 @@ export function containerName(agentId: string, instanceId = "default"): string {
   return "launchpad-" + safeInstance + "-" + safeAgent;
 }
 
+export function containerWorkspaceMountSource(
+  workspacePath: string,
+  config: AppConfig,
+): string {
+  const stagingRoot = path.resolve(config.workspaceRoot, ".staging");
+  const workspace = path.resolve(workspacePath);
+  const relative = path.relative(stagingRoot, workspace);
+  if (
+    relative === "" ||
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error("Agent Runtime may mount only a Run staging workspace");
+  }
+  return path.resolve(config.containerWorkspaceHostRoot, ".staging", relative);
+}
+
+export function validatedDependencyMountSource(
+  dependencyCachePath: string,
+  config: AppConfig,
+): string {
+  const root = path.resolve(config.dependencyCacheHostRoot);
+  const candidate = path.resolve(dependencyCachePath);
+  const relative = path.relative(root, candidate);
+  if (
+    path.basename(candidate) !== "node_modules" ||
+    !/^[a-f0-9]{64}[\\/]node_modules$/.test(relative) ||
+    relative.startsWith("..") ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error("Dependency mount is outside the managed cache root");
+  }
+  return candidate;
+}
+
 export function buildContainerRunArgs(
   request: RunnerRequest,
   config: AppConfig,
 ): string[] {
   const name = containerName(request.agentId, config.runtimeInstanceId);
   const engineName = config.containerEngine.split(/[\\/]/).at(-1)?.toLowerCase();
+  const workspaceMountSource = containerWorkspaceMountSource(
+    request.workspacePath,
+    config,
+  );
+  const dependencyMount = request.dependencyCachePath
+    ? validatedDependencyMountSource(request.dependencyCachePath, config)
+    : null;
   return [
     "run",
     "--rm",
+    "--pull",
+    "never",
     "--init",
     "--name",
     name,
@@ -77,9 +123,15 @@ export function buildContainerRunArgs(
     "--env",
     "NO_COLOR=1",
     "--mount",
-    "type=bind,src=" + request.workspacePath + ",dst=/workspace",
+    "type=bind,src=" + workspaceMountSource + ",dst=/workspace",
+    ...(dependencyMount
+      ? [
+          "--mount",
+          `type=bind,src=${dependencyMount},dst=/workspace/node_modules,readonly`,
+        ]
+      : []),
     "--mount",
-    "type=bind,src=" + config.codexHome + ",dst=/codex-home",
+    "type=bind,src=" + config.containerCodexHomeHostRoot + ",dst=/codex-home",
     "--workdir",
     "/workspace",
     config.containerRuntimeImage,

@@ -47,6 +47,19 @@ describe("JsonStore", () => {
     await store.initialize();
 
     expect(store.snapshot().runs[0]?.runVault).toBeNull();
+    expect(store.snapshot().runs[0]).toMatchObject({
+      parentRunId: null,
+      supersededByRunId: null,
+      revisionNumber: 0,
+      runVaultEvents: [],
+      runVaultMetrics: {
+        cleanupStatus: "not_required",
+        outcome: null,
+        verificationStatus: null,
+        changedFileCount: 0,
+        changedBytes: 0,
+      },
+    });
   });
 
   it("adds lifecycle evidence defaults to older RunVault decisions", async () => {
@@ -103,6 +116,16 @@ describe("JsonStore", () => {
       resolution: "policy",
       trustedWorkspaceFingerprint: null,
       stagingWorkspaceFingerprint: null,
+      findings: [],
+      changedFiles: { files: [], omittedFileCount: 0, changedBytes: 0 },
+      policy: {
+        version: 1,
+        profile: "standard",
+        capturedAt: "2026-01-01T00:00:00.000Z",
+        verificationMode: "allow-skipped",
+      },
+      retainedAt: "2026-01-01T00:00:01.000Z",
+      expiresAt: "2026-01-08T00:00:01.000Z",
     });
   });
 

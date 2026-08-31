@@ -8,10 +8,16 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
+import {
+  DependencyCacheUnavailableError,
+  DependencyManager,
+  type DependencyResolution,
+} from "./dependency-manager.js";
 import { RunCancelledError, RunTimedOutError } from "./errors.js";
+import { RunVaultVerifier } from "./runvault-verifier.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import {
@@ -63,6 +69,41 @@ class BlockingFinalizeWorkspaceManager extends RunVaultWorkspaceManager {
   }
 }
 
+class BlockingBeginPromotionWorkspaceManager extends RunVaultWorkspaceManager {
+  private signalBeginStarted!: () => void;
+  private allowBeginToContinue!: () => void;
+  readonly beginStarted: Promise<void>;
+  private readonly beginAllowed: Promise<void>;
+
+  constructor(workspaceRoot: string) {
+    super(workspaceRoot);
+    this.beginStarted = new Promise((resolve) => {
+      this.signalBeginStarted = resolve;
+    });
+    this.beginAllowed = new Promise((resolve) => {
+      this.allowBeginToContinue = resolve;
+    });
+  }
+
+  allowBegin(): void {
+    this.allowBeginToContinue();
+  }
+
+  override async beginPromotion(
+    id: string,
+    trustedWorkspacePath: string,
+    expectedTrustedFingerprint: string,
+  ): Promise<RunVaultPromotion> {
+    this.signalBeginStarted();
+    await this.beginAllowed;
+    return super.beginPromotion(
+      id,
+      trustedWorkspacePath,
+      expectedTrustedFingerprint,
+    );
+  }
+}
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -78,6 +119,9 @@ async function makeServiceHarness(
   runner: AgentRunner = new FakeRunner(),
   createRunVaultWorkspaces: (workspaceRoot: string) => RunVaultWorkspaceManager =
     (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
+  verifier?: RunVaultVerifier,
+  dependencies?: DependencyManager,
+  environment: NodeJS.ProcessEnv = {},
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
@@ -89,6 +133,8 @@ async function makeServiceHarness(
     CODEX_HOME: path.join(root, "codex"),
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
+    VERIFICATION_PROVIDER: "host",
+    ...environment,
   });
   const store = new JsonStore(path.join(root, "data", "db.json"));
   const workspaces = new WorkspaceManager(workspaceRoot);
@@ -99,6 +145,8 @@ async function makeServiceHarness(
     workspaces,
     runner,
     runVaultWorkspaces,
+    verifier,
+    dependencies,
   );
   await service.initialize();
   return { config, root, runVaultWorkspaces, service, store };
@@ -111,6 +159,20 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
 async function trustedFingerprint(workspacePath: string): Promise<string> {
   const manager = new RunVaultWorkspaceManager(path.dirname(workspacePath));
   return (await manager.snapshotWorkspace(workspacePath)).fingerprint;
+}
+
+function fakeDependencyManager(
+  resolve: (workspacePath: string) => Promise<DependencyResolution>,
+  prepare = async () => ({
+    status: "prepared" as const,
+    cacheKey: "a".repeat(64),
+  }),
+): DependencyManager {
+  return {
+    initialize: async () => undefined,
+    resolve,
+    prepare,
+  } as unknown as DependencyManager;
 }
 
 describe("Agent lifecycle", () => {
@@ -139,6 +201,341 @@ describe("Agent lifecycle", () => {
       outcome: "promoted",
       reason: "verified_safe",
     });
+    expect(service.getRun(run.id).runVaultEvents.map((event) => event.type)).toEqual([
+      "staged",
+      "inspected",
+      "verified",
+      "decided",
+      "promoted",
+    ]);
+    expect(service.getRun(run.id).runVaultMetrics).toMatchObject({
+      cleanupStatus: "completed",
+      outcome: "promoted",
+      verificationStatus: "skipped",
+      changedFileCount: 0,
+      changedBytes: 0,
+    });
+    expect(service.getRun(run.id).runVaultMetrics.stagingDurationMs).toEqual(
+      expect.any(Number),
+    );
+  });
+
+  it("aggregates path-free operational diagnostics", async () => {
+    const verifier = new RunVaultVerifier({
+      runner: {
+        isAvailable: async () => true,
+        run: async () => ({
+          status: "passed",
+          command: "npm test",
+          redactedSummary: "passed",
+          exitCode: 0,
+          timedOut: false,
+        }),
+      },
+    });
+    const harness = await makeServiceHarness(
+      new FakeRunner(),
+      (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
+      verifier,
+    );
+    const agent = await harness.service.createAgent({ name: "Observed builder" });
+    const { run } = await harness.service.sendMessage(agent.id, "observe this run");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    const diagnostics = await harness.service.runVaultDiagnostics();
+    expect(diagnostics).toMatchObject({
+      verifierAvailable: true,
+      storageModel: "single-process-json",
+      tamperProof: false,
+      staging: { retainedRunCount: 0, orphanCount: 0 },
+      dependencies: { mode: "disabled", activePreparations: 0 },
+      metrics: {
+        totalRuns: 1,
+        decidedRuns: 1,
+        outcomes: { promoted: 1, quarantined: 0, discarded: 0 },
+        cleanupFailures: 0,
+      },
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain(agent.workspacePath);
+  });
+
+  it("passes the same managed dependency cache to Agent and verification", async () => {
+    const cachePath = `/host/dependencies/${"a".repeat(64)}/node_modules`;
+    const requests: RunnerRequest[] = [];
+    const verificationOptions: Array<{ dependencyCachePath: string | null }> = [];
+    const runner: AgentRunner = {
+      run: async (request) => {
+        requests.push(request);
+        return { output: "done", threadId: "dependency-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const verifier = new RunVaultVerifier({
+      runner: {
+        run: async (_workspacePath, options) => {
+          verificationOptions.push(options);
+          return {
+            status: "passed",
+            command: "npm test",
+            redactedSummary: "passed",
+            exitCode: 0,
+            timedOut: false,
+          };
+        },
+      },
+    });
+    const dependencies = fakeDependencyManager(async () => ({
+      status: "available",
+      cacheKey: "a".repeat(64),
+      mountPath: cachePath,
+      message: "available",
+    }));
+    const harness = await makeServiceHarness(
+      runner,
+      undefined,
+      verifier,
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Cache user" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test" } }),
+    );
+    await writeFile(
+      path.join(agent.workspacePath, "package-lock.json"),
+      JSON.stringify({ lockfileVersion: 3 }),
+    );
+
+    const { run } = await harness.service.sendMessage(agent.id, "use dependencies");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    expect(requests[0]?.dependencyCachePath).toBe(cachePath);
+    expect(verificationOptions[0]?.dependencyCachePath).toBe(cachePath);
+  });
+
+  it("fails before Agent execution when a required cache is missing", async () => {
+    const run = vi.fn(async () => ({
+      output: "should not run",
+      threadId: "unexpected-thread",
+      usage: null,
+    }));
+    const dependencies = fakeDependencyManager(async () => ({
+      status: "missing",
+      cacheKey: "b".repeat(64),
+      mountPath: null,
+      message: "No matching managed dependency cache is prepared.",
+    }));
+    const harness = await makeServiceHarness(
+      { run, cancel: async () => false, isAvailable: async () => true },
+      undefined,
+      undefined,
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Missing cache" });
+    const result = await harness.service.sendMessage(agent.id, "run");
+    await expect.poll(() => harness.service.getRun(result.run.id).status).toBe("failed");
+
+    expect(run).not.toHaveBeenCalled();
+    expect(harness.service.getRun(result.run.id).error).toContain(
+      "Prepare dependencies explicitly",
+    );
+  });
+
+  it("prepares dependencies explicitly and releases the Agent reservation", async () => {
+    const prepare = vi.fn(async () => ({
+      status: "prepared" as const,
+      cacheKey: "d".repeat(64),
+    }));
+    const dependencies = fakeDependencyManager(
+      async () => ({
+        status: "missing",
+        cacheKey: "d".repeat(64),
+        mountPath: null,
+        message: "missing",
+      }),
+      prepare,
+    );
+    const harness = await makeServiceHarness(
+      undefined,
+      undefined,
+      undefined,
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Preparer" });
+
+    await expect(
+      harness.service.prepareDependencies(agent.id, true),
+    ).resolves.toEqual({ status: "prepared", cacheKey: "d".repeat(64) });
+    expect(prepare).toHaveBeenCalledWith(agent.workspacePath, true);
+    expect(harness.service.getAgent(agent.id).status).toBe("ready");
+  });
+
+  it("returns a client error when dependency preparation cannot describe manifests", async () => {
+    const dependencies = fakeDependencyManager(
+      async () => ({
+        status: "missing",
+        cacheKey: null,
+        mountPath: null,
+        message: "missing",
+      }),
+      async () => {
+        throw new DependencyCacheUnavailableError("package.json could not be parsed");
+      },
+    );
+    const harness = await makeServiceHarness(
+      undefined,
+      undefined,
+      undefined,
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Bad manifest" });
+
+    await expect(harness.service.prepareDependencies(agent.id, true)).rejects
+      .toMatchObject({ statusCode: 409 });
+    expect(harness.service.getAgent(agent.id).status).toBe("ready");
+  });
+
+  it("never verifies with stale dependencies after a lockfile change", async () => {
+    let resolutionCall = 0;
+    const dependencies = fakeDependencyManager(async () => {
+      resolutionCall += 1;
+      return resolutionCall === 1
+        ? {
+            status: "available" as const,
+            cacheKey: "a".repeat(64),
+            mountPath: `/cache/${"a".repeat(64)}/node_modules`,
+            message: "available",
+          }
+        : {
+            status: "missing" as const,
+            cacheKey: "b".repeat(64),
+            mountPath: null,
+            message: "No matching managed dependency cache is prepared.",
+          };
+    });
+    const verify = vi.fn(async () => ({
+      status: "passed" as const,
+      command: "npm test",
+      redactedSummary: "passed",
+      exitCode: 0,
+      timedOut: false,
+    }));
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await writeFile(
+          path.join(request.workspacePath, "package-lock.json"),
+          JSON.stringify({ lockfileVersion: 3, changed: true }),
+        );
+        return { output: "updated lock", threadId: "lock-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const harness = await makeServiceHarness(
+      runner,
+      undefined,
+      new RunVaultVerifier({ runner: { run: verify } }),
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Lock updater" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test" } }),
+    );
+    await writeFile(
+      path.join(agent.workspacePath, "package-lock.json"),
+      JSON.stringify({ lockfileVersion: 3 }),
+    );
+
+    const { run } = await harness.service.sendMessage(agent.id, "update lock");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    expect(verify).not.toHaveBeenCalled();
+    expect(harness.service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "dependency_change",
+      verification: {
+        status: "unavailable",
+        redactedSummary: expect.stringContaining("stale dependencies"),
+      },
+    });
+  });
+
+  it("preserves trusted Git metadata across an automatically promoted Run", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "source.ts"), "promoted\n");
+        return {
+          output: "Updated source",
+          threadId: "git-preserving-thread",
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Repository builder" });
+    await mkdir(path.join(agent.workspacePath, ".git"));
+    await writeFile(
+      path.join(agent.workspacePath, ".git", "config"),
+      "[core]\nrepositoryformatversion = 0\n",
+    );
+
+    const { run } = await service.sendMessage(agent.id, "update source");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault?.outcome).toBe("promoted");
+    await expect(
+      readFile(path.join(agent.workspacePath, ".git", "config"), "utf8"),
+    ).resolves.toContain("repositoryformatversion");
+    await expect(
+      readFile(path.join(agent.workspacePath, "source.ts"), "utf8"),
+    ).resolves.toBe("promoted\n");
+  });
+
+  it("includes verifier-created source changes in final inspection", async () => {
+    const verifier = new RunVaultVerifier({
+      runner: {
+        run: async (workspacePath) => {
+          await writeFile(
+            path.join(workspacePath, "verification-generated.ts"),
+            "export const verified = true;\n",
+          );
+          return {
+            status: "passed",
+            command: "npm test",
+            redactedSummary: "Tests passed.",
+            exitCode: 0,
+            timedOut: false,
+          };
+        },
+      },
+    });
+    const harness = await makeServiceHarness(
+      new FakeRunner(),
+      (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
+      verifier,
+    );
+    const agent = await harness.service.createAgent({ name: "Verifier writer" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test" } }),
+    );
+
+    const { run } = await harness.service.sendMessage(agent.id, "verify source");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    expect(harness.service.getRun(run.id).runVault).toMatchObject({
+      outcome: "promoted",
+      changedFiles: {
+        addedCount: 1,
+        files: [{ path: "verification-generated.ts", kind: "added" }],
+      },
+    });
+    await expect(
+      readFile(path.join(agent.workspacePath, "verification-generated.ts"), "utf8"),
+    ).resolves.toBe("export const verified = true;\n");
   });
 
   it("forks only from the last promoted thread after a discarded Run", async () => {
@@ -368,14 +765,21 @@ describe("Agent lifecycle", () => {
 
   it("quarantines a secret-like file without persisting its contents", async () => {
     const secret = "RUNVAULT_TEST_SECRET=never-expose-this-value\n";
-    const service = await makeService({
-      run: async (request) => {
-        await writeFile(path.join(request.workspacePath, ".env"), secret);
-        return { output: "Prepared local config", threadId: "secret-thread", usage: null };
+    const harness = await makeServiceHarness(
+      {
+        run: async (request) => {
+          await writeFile(path.join(request.workspacePath, ".env"), secret);
+          return {
+            output: "Prepared local config",
+            threadId: "secret-thread",
+            usage: null,
+          };
+        },
+        cancel: async () => false,
+        isAvailable: async () => true,
       },
-      cancel: async () => false,
-      isAvailable: async () => true,
-    });
+    );
+    const service = harness.service;
     const agent = await service.createAgent({ name: "Secret-aware builder" });
     const before = await trustedFingerprint(agent.workspacePath);
 
@@ -389,6 +793,22 @@ describe("Agent lifecycle", () => {
       changedFiles: { protectedPathsTouched: [".env"] },
     });
     expect(JSON.stringify(completed.runVault)).not.toContain("never-expose-this-value");
+    const evidence = service.getRunVaultEvidence(run.id);
+    const serializedEvidence = JSON.stringify(evidence);
+    expect(serializedEvidence).not.toContain(secret.trim());
+    expect(serializedEvidence).not.toContain("prepare local secrets");
+    expect(serializedEvidence).not.toContain("Prepared local config");
+    expect(serializedEvidence).not.toContain(agent.workspacePath);
+    expect(evidence.decision.verification).toEqual({
+      status: "skipped",
+      command: null,
+    });
+    expect(
+      await readFile(path.join(harness.root, "data", "db.json"), "utf8"),
+    ).not.toContain(secret.trim());
+    expect(JSON.stringify(await service.getRunVaultReview(run.id))).not.toContain(
+      secret.trim(),
+    );
     expect(await trustedFingerprint(agent.workspacePath)).toBe(before);
     await expect(lstat(path.join(agent.workspacePath, ".env"))).rejects
       .toMatchObject({ code: "ENOENT" });
@@ -489,6 +909,79 @@ describe("Agent lifecycle", () => {
     expect(service.getMessages(agent.id).map((message) => message.role)).toEqual(["user"]);
   });
 
+  it("revalidates retained review state and serves only safe recorded diffs", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, "package-lock.json"), "staged\n");
+        await writeFile(path.join(request.workspacePath, "large.txt"), "x".repeat(70_000));
+        await writeFile(
+          path.join(request.workspacePath, "binary.dat"),
+          Buffer.from([0, 1, 2, 3]),
+        );
+        await mkdir(path.join(request.workspacePath, "deploy"));
+        await writeFile(
+          path.join(request.workspacePath, "deploy", "secret.txt"),
+          "PROTECTED-CONTENT\n",
+        );
+        return { output: "Prepared review", threadId: "review-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Review builder" });
+    await writeFile(path.join(agent.workspacePath, "package-lock.json"), "trusted\n");
+    const { run } = await service.sendMessage(agent.id, "prepare review");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    await expect(service.getRunVaultReview(run.id)).resolves.toMatchObject({
+      availability: "available",
+      stagingFingerprintVerified: true,
+      trustedFingerprintVerified: true,
+    });
+    await expect(
+      service.getRunVaultDiff(run.id, "package-lock.json"),
+    ).resolves.toMatchObject({
+      status: "available",
+      diff: expect.stringContaining("-trusted"),
+    });
+    const protectedDiff = await service.getRunVaultDiff(
+      run.id,
+      "deploy/secret.txt",
+    );
+    expect(protectedDiff).toEqual({
+      path: "deploy/secret.txt",
+      status: "protected",
+      diff: null,
+      truncated: false,
+    });
+    expect(JSON.stringify(protectedDiff)).not.toContain("PROTECTED-CONTENT");
+    await expect(service.getRunVaultDiff(run.id, "large.txt")).resolves.toMatchObject({
+      status: "too_large",
+      diff: null,
+    });
+    await expect(service.getRunVaultDiff(run.id, "binary.dat")).resolves.toMatchObject({
+      status: "binary",
+      diff: null,
+    });
+    await expect(
+      service.getRunVaultDiff(run.id, "../deploy/secret.txt"),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    const stagingPath = path.join(
+      path.dirname(agent.workspacePath),
+      ".staging",
+      run.id,
+    );
+    await writeFile(path.join(stagingPath, "package-lock.json"), "tampered\n");
+    await expect(service.getRunVaultReview(run.id)).resolves.toMatchObject({
+      availability: "staging_tampered",
+      stagingFingerprintVerified: false,
+    });
+    await expect(
+      service.getRunVaultDiff(run.id, "package-lock.json"),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
   it("approves quarantined work exactly once and commits its thread", async () => {
     const service = await makeService({
       run: async (request) => {
@@ -523,6 +1016,265 @@ describe("Agent lifecycle", () => {
       service.getMessages(agent.id).filter((message) => message.role === "assistant"),
     ).toHaveLength(1);
     await expect(service.discardRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("never approves Agent-created Git metadata", async () => {
+    const service = await makeService({
+      run: async (request) => {
+        await mkdir(path.join(request.workspacePath, ".git"));
+        return {
+          output: "Created repository metadata",
+          threadId: "git-metadata-thread",
+          usage: null,
+        };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Metadata builder" });
+    const { run } = await service.sendMessage(agent.id, "initialize git");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "protected_path",
+      changedFiles: {
+        files: [{ path: ".git", kind: "added", protected: true }],
+      },
+    });
+    await expect(service.approveRun(run.id)).rejects.toMatchObject({
+      statusCode: 409,
+      message:
+        "Agent-created Git or dependency metadata cannot be approved; request a revision that removes it",
+    });
+    await expect(lstat(path.join(agent.workspacePath, ".git"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("creates an independently inspected child revision from retained work", async () => {
+    let call = 0;
+    const seenBaseThreads: Array<string | null> = [];
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        seenBaseThreads.push(request.threadId);
+        if (call === 1) {
+          await mkdir(path.join(request.workspacePath, "deploy"));
+          await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "risk\n");
+          return { output: "Prepared risky work", threadId: "parent-thread", usage: null };
+        }
+        await expect(
+          readFile(path.join(request.workspacePath, "deploy", "app.yml"), "utf8"),
+        ).resolves.toBe("risk\n");
+        const { rm } = await import("node:fs/promises");
+        await rm(path.join(request.workspacePath, "deploy"), { recursive: true });
+        await mkdir(path.join(request.workspacePath, "src"));
+        await writeFile(path.join(request.workspacePath, "src", "safe.ts"), "export {};\n");
+        return { output: "Revised safely", threadId: "child-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Revision builder" });
+    const { run: parent } = await service.sendMessage(agent.id, "prepare deployment");
+    await expect.poll(() => service.getRun(parent.id).status).toBe("completed");
+
+    const { run: child } = await service.requestRevision(
+      parent.id,
+      "Remove the deployment change and use safe source code",
+    );
+    await expect.poll(() => service.getRun(child.id).status).toBe("completed");
+
+    expect(seenBaseThreads).toEqual([null, "parent-thread"]);
+    expect(service.getRun(child.id)).toMatchObject({
+      parentRunId: parent.id,
+      revisionNumber: 1,
+      runVault: { outcome: "promoted", reason: "verified_safe" },
+    });
+    expect(service.getRun(parent.id)).toMatchObject({
+      supersededByRunId: child.id,
+      runVault: { outcome: "quarantined", reason: "protected_path" },
+    });
+    expect(service.getRun(parent.id).runVaultEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "revision_requested",
+          relatedRunId: child.id,
+        }),
+      ]),
+    );
+    expect(service.getRun(child.id).runVaultEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "revision_requested",
+          relatedRunId: parent.id,
+        }),
+      ]),
+    );
+    expect(service.getAgent(agent.id).codexThreadId).toBe("child-thread");
+    await expect(
+      readFile(path.join(agent.workspacePath, "src", "safe.ts"), "utf8"),
+    ).resolves.toBe("export {};\n");
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      lstat(path.join(path.dirname(agent.workspacePath), ".staging", parent.id)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("promotes only the final Run in a three-generation revision lineage", async () => {
+    let call = 0;
+    const baseThreads: Array<string | null> = [];
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        baseThreads.push(request.threadId);
+        if (call === 1) {
+          await mkdir(path.join(request.workspacePath, "deploy"));
+          await writeFile(
+            path.join(request.workspacePath, "deploy", "first.yml"),
+            "first risk\n",
+          );
+          return { output: "First proposal", threadId: "lineage-1", usage: null };
+        }
+        if (call === 2) {
+          await writeFile(
+            path.join(request.workspacePath, "deploy", "second.yml"),
+            "second risk\n",
+          );
+          return { output: "Second proposal", threadId: "lineage-2", usage: null };
+        }
+        const { rm } = await import("node:fs/promises");
+        await rm(path.join(request.workspacePath, "deploy"), { recursive: true });
+        await mkdir(path.join(request.workspacePath, "src"));
+        await writeFile(
+          path.join(request.workspacePath, "src", "final.ts"),
+          "export const final = true;\n",
+        );
+        return { output: "Final proposal", threadId: "lineage-3", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Lineage builder" });
+    const { run: rootRun } = await service.sendMessage(agent.id, "first proposal");
+    await expect.poll(() => service.getRun(rootRun.id).status).toBe("completed");
+    const { run: childRun } = await service.requestRevision(
+      rootRun.id,
+      "try a second proposal",
+    );
+    await expect.poll(() => service.getRun(childRun.id).status).toBe("completed");
+    const { run: grandchildRun } = await service.requestRevision(
+      childRun.id,
+      "remove all deployment changes",
+    );
+    await expect.poll(() => service.getRun(grandchildRun.id).status).toBe("completed");
+
+    expect(baseThreads).toEqual([null, "lineage-1", "lineage-2"]);
+    expect(service.getRun(rootRun.id)).toMatchObject({
+      parentRunId: null,
+      supersededByRunId: childRun.id,
+      revisionNumber: 0,
+      runVault: { outcome: "quarantined" },
+    });
+    expect(service.getRun(childRun.id)).toMatchObject({
+      parentRunId: rootRun.id,
+      supersededByRunId: grandchildRun.id,
+      revisionNumber: 1,
+      runVault: { outcome: "quarantined" },
+    });
+    expect(service.getRun(grandchildRun.id)).toMatchObject({
+      parentRunId: childRun.id,
+      supersededByRunId: null,
+      revisionNumber: 2,
+      runVault: { outcome: "promoted" },
+    });
+    expect(
+      service.getRunVaultHistory({ lineageRunId: childRun.id }).map((run) => run.id),
+    ).toEqual([grandchildRun.id, childRun.id, rootRun.id]);
+    expect(service.getAgent(agent.id).codexThreadId).toBe("lineage-3");
+    await expect(
+      readFile(path.join(agent.workspacePath, "src", "final.ts"), "utf8"),
+    ).resolves.toBe("export const final = true;\n");
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps parent evidence and staging when a revision fails", async () => {
+    let call = 0;
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        if (call === 1) {
+          await mkdir(path.join(request.workspacePath, "deploy"));
+          await writeFile(path.join(request.workspacePath, "deploy", "app.yml"), "risk\n");
+          return { output: "Parent proposal", threadId: "parent-failure-thread", usage: null };
+        }
+        throw new Error("revision failed");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Failed revision" });
+    const { run: parent } = await service.sendMessage(agent.id, "prepare risk");
+    await expect.poll(() => service.getRun(parent.id).status).toBe("completed");
+    const originalDecision = structuredClone(service.getRun(parent.id).runVault);
+
+    const { run: child } = await service.requestRevision(parent.id, "fix it");
+    await expect.poll(() => service.getRun(child.id).status).toBe("failed");
+
+    expect(service.getRun(parent.id).runVault).toEqual(originalDecision);
+    expect(service.getRun(parent.id).supersededByRunId).toBe(child.id);
+    expect(service.getAgent(agent.id).codexThreadId).toBeNull();
+    await expect(
+      lstat(path.join(path.dirname(agent.workspacePath), ".staging", parent.id)),
+    ).resolves.toBeDefined();
+    await expect(lstat(path.join(agent.workspacePath, "deploy"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("keeps the committed thread unchanged when a revision is cancelled", async () => {
+    let call = 0;
+    const service = await makeService({
+      run: async (request) => {
+        call += 1;
+        if (call === 1) {
+          await mkdir(path.join(request.workspacePath, "deploy"));
+          await writeFile(
+            path.join(request.workspacePath, "deploy", "app.yml"),
+            "risk\n",
+          );
+          return { output: "Parent proposal", threadId: "cancel-parent", usage: null };
+        }
+        await writeFile(path.join(request.workspacePath, "partial.txt"), "partial\n");
+        throw new RunCancelledError();
+      },
+      cancel: async () => true,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Cancelled revision" });
+    const { run: parent } = await service.sendMessage(agent.id, "prepare risk");
+    await expect.poll(() => service.getRun(parent.id).status).toBe("completed");
+    const parentFingerprint = await trustedFingerprint(agent.workspacePath);
+
+    const { run: child } = await service.requestRevision(parent.id, "cancel revision");
+    await expect.poll(() => service.getRun(child.id).status).toBe("cancelled");
+
+    expect(service.getRun(parent.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      provisionalThreadId: "cancel-parent",
+    });
+    expect(service.getRun(child.id)).toMatchObject({
+      parentRunId: parent.id,
+      status: "cancelled",
+      runVault: { outcome: "discarded", reason: "cancelled" },
+    });
+    expect(service.getAgent(agent.id).codexThreadId).toBeNull();
+    expect(await trustedFingerprint(agent.workspacePath)).toBe(parentFingerprint);
+    await expect(lstat(path.join(agent.workspacePath, "partial.txt"))).rejects
+      .toMatchObject({ code: "ENOENT" });
   });
 
   it("discards quarantined work idempotently without committing its thread", async () => {
@@ -1022,4 +1774,256 @@ describe("Agent lifecycle", () => {
     finish({ output: "done", threadId: "thread", usage: null });
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
   });
+
+  it("captures an immutable strict policy snapshot for each Run", async () => {
+    let runnerStarted!: () => void;
+    let finishRunner!: () => void;
+    const started = new Promise<void>((resolve) => {
+      runnerStarted = resolve;
+    });
+    const finish = new Promise<void>((resolve) => {
+      finishRunner = resolve;
+    });
+    const runner: AgentRunner = {
+      run: async (request) => {
+        runnerStarted();
+        await finish;
+        await writeFile(path.join(request.workspacePath, "safe.ts"), "safe\n");
+        return { output: "safe change", threadId: "strict-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const harness = await makeServiceHarness(
+      runner,
+      undefined,
+      undefined,
+      undefined,
+      { RUNVAULT_POLICY_PROFILE: "strict" },
+    );
+    const agent = await harness.service.createAgent({ name: "Strict policy" });
+    const { run } = await harness.service.sendMessage(agent.id, "change safely");
+    await started;
+
+    harness.config.runVaultPolicy.profile = "standard";
+    harness.config.runVaultPolicy.verificationMode = "allow-skipped";
+    finishRunner();
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    expect(harness.service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      reason: "verification_required",
+      verification: { status: "skipped" },
+      policy: {
+        profile: "strict",
+        verificationMode: "require-verification",
+        capturedAt: run.createdAt,
+      },
+      retainedAt: expect.any(String),
+      expiresAt: expect.any(String),
+    });
+    harness.service.shutdown();
+  });
+
+  it("discards staging growth that exceeds the per-Run quota", async () => {
+    const run = vi.fn(async (request: RunnerRequest) => {
+      await writeFile(
+        path.join(request.workspacePath, "oversized.bin"),
+        Buffer.alloc(1_048_577),
+      );
+      return { output: "large output", threadId: "quota-thread", usage: null };
+    });
+    const harness = await makeServiceHarness(
+      { run, cancel: async () => false, isAvailable: async () => true },
+      undefined,
+      undefined,
+      undefined,
+      {
+        RUNVAULT_MAX_CHANGED_BYTES: "1048576",
+        RUNVAULT_STAGING_PER_RUN_BYTES: "1048576",
+        RUNVAULT_STAGING_TOTAL_BYTES: "2097152",
+        RUNVAULT_QUOTA_POLL_MS: "100",
+      },
+    );
+    const agent = await harness.service.createAgent({ name: "Quota test" });
+    const { run: created } = await harness.service.sendMessage(agent.id, "grow");
+    await expect.poll(() => harness.service.getRun(created.id).status).toBe("failed");
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(harness.service.getRun(created.id).runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "staging_quota_exceeded",
+      findings: expect.arrayContaining([
+        expect.objectContaining({ code: "staging_quota_exceeded" }),
+      ]),
+      policy: { stagingPerRunBytes: 1_048_576 },
+    });
+    await expect(lstat(path.join(agent.workspacePath, "oversized.bin"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    await expect(lstat(harness.runVaultWorkspaces.stagingPath(created.id))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    harness.service.shutdown();
+  });
+
+  it("expires quarantine idempotently without advancing its thread", async () => {
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, ".env"), "SECRET=value\n");
+        return { output: "changed env", threadId: "expired-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const harness = await makeServiceHarness(
+      runner,
+      undefined,
+      undefined,
+      undefined,
+      { RUNVAULT_QUARANTINE_RETENTION_MS: "60000" },
+    );
+    const agent = await harness.service.createAgent({ name: "Expiry test" });
+    const { run } = await harness.service.sendMessage(agent.id, "change env");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+    const quarantined = harness.service.getRun(run.id).runVault!;
+    expect(quarantined).toMatchObject({
+      outcome: "quarantined",
+      retainedAt: expect.any(String),
+      expiresAt: expect.any(String),
+    });
+
+    const expiry = Date.parse(quarantined.expiresAt!);
+    await expect(harness.service.sweepExpiredQuarantines(expiry + 1)).resolves.toBe(1);
+    await expect(harness.service.sweepExpiredQuarantines(expiry + 2)).resolves.toBe(0);
+
+    const expired = harness.service.getRun(run.id);
+    expect(expired.runVault).toMatchObject({
+      outcome: "discarded",
+      reason: "retention_expired",
+      resolution: "expired",
+      provisionalThreadId: "expired-thread",
+      findings: expect.arrayContaining([
+        expect.objectContaining({ code: "retention_expired" }),
+      ]),
+    });
+    expect(expired.runVaultEvents.map((event) => event.type)).toEqual(
+      expect.arrayContaining(["expired", "discarded"]),
+    );
+    expect(expired.runVaultMetrics).toMatchObject({
+      outcome: "discarded",
+      cleanupStatus: "completed",
+    });
+    expect(JSON.stringify(expired.runVault)).not.toContain("SECRET=value");
+    expect(harness.service.getAgent(agent.id).codexThreadId).toBeNull();
+    await expect(lstat(harness.runVaultWorkspaces.stagingPath(run.id))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    await expect(harness.service.approveRun(run.id)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(harness.service.requestRevision(run.id, "try again")).rejects
+      .toMatchObject({ statusCode: 409 });
+    harness.service.shutdown();
+  });
+
+  it("does not expire a quarantine while approval owns the Agent reservation", async () => {
+    let runVaultWorkspaces!: BlockingBeginPromotionWorkspaceManager;
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await writeFile(path.join(request.workspacePath, ".env"), "protected\n");
+        return { output: "review me", threadId: "approved-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const harness = await makeServiceHarness(
+      runner,
+      (workspaceRoot) => {
+        runVaultWorkspaces = new BlockingBeginPromotionWorkspaceManager(
+          workspaceRoot,
+        );
+        return runVaultWorkspaces;
+      },
+      undefined,
+      undefined,
+      { RUNVAULT_QUARANTINE_RETENTION_MS: "60000" },
+    );
+    const agent = await harness.service.createAgent({ name: "Approval race" });
+    const { run } = await harness.service.sendMessage(agent.id, "change env");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+    const expiresAt = Date.parse(harness.service.getRun(run.id).runVault!.expiresAt!);
+
+    const approval = harness.service.approveRun(run.id);
+    await runVaultWorkspaces.beginStarted;
+    const competingActions = await Promise.allSettled([
+      harness.service.approveRun(run.id),
+      harness.service.discardRun(run.id),
+      harness.service.requestRevision(run.id, "competing revision"),
+    ]);
+    expect(competingActions).toHaveLength(3);
+    for (const action of competingActions) {
+      expect(action).toMatchObject({
+        status: "rejected",
+        reason: { statusCode: 409 },
+      });
+    }
+    await expect(harness.service.sweepExpiredQuarantines(expiresAt + 1))
+      .resolves.toBe(0);
+    expect(harness.service.getRun(run.id).runVault?.outcome).toBe("quarantined");
+
+    runVaultWorkspaces.allowBegin();
+    await expect(approval).resolves.toMatchObject({
+      runVault: { outcome: "promoted", resolution: "human_approved" },
+    });
+    expect(harness.service.getRun(run.id).runVaultEvents.map((event) => event.type))
+      .toEqual(expect.arrayContaining(["approved", "promoted"]));
+    await expect(harness.service.sweepExpiredQuarantines(expiresAt + 2))
+      .resolves.toBe(0);
+    expect(harness.service.getAgent(agent.id).codexThreadId).toBe("approved-thread");
+    harness.service.shutdown();
+  });
+
+  it("lets Agent deletion cancel an in-flight approval without promoting work", async () => {
+    let runVaultWorkspaces!: BlockingBeginPromotionWorkspaceManager;
+    const harness = await makeServiceHarness(
+      {
+        run: async (request) => {
+          await writeFile(path.join(request.workspacePath, ".env"), "delete race\n");
+          return { output: "review me", threadId: "deleted-approval", usage: null };
+        },
+        cancel: async () => false,
+        isAvailable: async () => true,
+      },
+      (workspaceRoot) => {
+        runVaultWorkspaces = new BlockingBeginPromotionWorkspaceManager(
+          workspaceRoot,
+        );
+        return runVaultWorkspaces;
+      },
+    );
+    const agent = await harness.service.createAgent({ name: "Deletion race" });
+    await writeFile(path.join(agent.workspacePath, "trusted.txt"), "trusted\n");
+    const trustedBefore = await trustedFingerprint(agent.workspacePath);
+    const { run } = await harness.service.sendMessage(agent.id, "change env");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+    const stagingPath = harness.runVaultWorkspaces.stagingPath(run.id);
+
+    const approval = harness.service.approveRun(run.id);
+    await runVaultWorkspaces.beginStarted;
+    const approvalResult = expect(approval).rejects.toMatchObject({
+      statusCode: 409,
+      message: "Run approval was cancelled",
+    });
+    const deletion = harness.service.deleteAgent(agent.id);
+    runVaultWorkspaces.allowBegin();
+
+    await approvalResult;
+    const { archivedWorkspace } = await deletion;
+    expect(await trustedFingerprint(archivedWorkspace)).toBe(trustedBefore);
+    await expect(readFile(path.join(archivedWorkspace, "trusted.txt"), "utf8"))
+      .resolves.toBe("trusted\n");
+    await expect(lstat(path.join(archivedWorkspace, ".env"))).rejects
+      .toMatchObject({ code: "ENOENT" });
+    await expect(lstat(stagingPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(() => harness.service.getAgent(agent.id)).toThrow("Agent not found");
+    harness.service.shutdown();
+  }, 10_000);
 });

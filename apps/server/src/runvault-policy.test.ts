@@ -41,8 +41,12 @@ describe("RunVault deterministic policy", () => {
         addedCount: 0,
         modifiedCount: 1,
         deletedCount: 0,
+        changedBytes: 0,
         protectedPathsTouched: [],
+        files: [change("src/index.ts")],
+        omittedFileCount: 0,
       },
+      findings: [],
     });
   });
 
@@ -50,6 +54,14 @@ describe("RunVault deterministic policy", () => {
     expect(evaluate({ verificationStatus: "skipped" })).toMatchObject({
       outcome: "promoted",
       reason: "verified_safe",
+    });
+  });
+
+  it("does not treat unavailable verification as an allowed skip", () => {
+    expect(evaluate({ verificationStatus: "unavailable" })).toMatchObject({
+      outcome: "quarantined",
+      reason: "verification_unavailable",
+      findings: [expect.objectContaining({ code: "verification_unavailable" })],
     });
   });
 
@@ -111,9 +123,50 @@ describe("RunVault deterministic policy", () => {
         addedCount: 1,
         modifiedCount: 1,
         deletedCount: 1,
+        changedBytes: 0,
         protectedPathsTouched: [".env.production", "deploy/app.yaml"],
+        files: [
+          change(".env.production", { protected: true }),
+          change("deploy/app.yaml", { protected: true, kind: "deleted" }),
+          change("src/index.ts", { kind: "added" }),
+        ],
+        omittedFileCount: 0,
       },
+      findings: [{
+        code: "protected_path",
+        severity: "warning",
+        title: "Protected path changed",
+        explanation: "A protected path was changed.",
+        paths: [".env.production", "deploy/app.yaml"],
+        omittedPathCount: 0,
+      }],
     });
+  });
+
+  it("reports all applicable findings while preserving primary precedence", () => {
+    const result = evaluate({
+      verificationStatus: "failed",
+      trustedWorkspaceChanged: true,
+      changes: [
+        change(".env", { protected: true, dependencyFile: true, binary: true, symbolicLink: true }),
+      ],
+    });
+    expect(result.reason).toBe("verification_failed");
+    expect(result.findings.map((item) => item.code)).toEqual([
+      "verification_failed", "trusted_workspace_changed", "unsafe_link",
+      "protected_path", "dependency_change", "unsafe_file",
+    ]);
+  });
+
+  it("bounds file manifests and finding paths", () => {
+    const changes = Array.from({ length: 105 }, (_, index) =>
+      change(`src/${index}.ts`, { protected: true }),
+    );
+    const result = evaluate({ changes });
+    expect(result.changedFiles.files).toHaveLength(100);
+    expect(result.changedFiles.omittedFileCount).toBe(5);
+    expect(result.findings[0]?.paths).toHaveLength(50);
+    expect(result.findings[0]?.omittedPathCount).toBe(55);
   });
 
   it("quarantines dependency files", () => {
@@ -162,5 +215,51 @@ describe("RunVault deterministic policy", () => {
     ).toMatchObject({ outcome: "quarantined", reason: "change_limit_exceeded" });
     expect(DEFAULT_MAX_CHANGED_FILES).toBe(20);
     expect(DEFAULT_MAX_DELETED_FILES).toBe(5);
+  });
+
+  it("requires passing verification in require-verification mode", () => {
+    expect(
+      evaluate({
+        verificationStatus: "skipped",
+        verificationMode: "require-verification",
+      }),
+    ).toMatchObject({
+      outcome: "quarantined",
+      reason: "verification_required",
+      findings: [expect.objectContaining({ code: "verification_required" })],
+    });
+    expect(
+      evaluate({
+        verificationStatus: "unavailable",
+        verificationMode: "require-verification",
+      }),
+    ).toMatchObject({
+      outcome: "quarantined",
+      reason: "verification_required",
+      findings: [
+        expect.objectContaining({ code: "verification_unavailable" }),
+        expect.objectContaining({ code: "verification_required" }),
+      ],
+    });
+  });
+
+  it("quarantines only after the changed-byte limit is exceeded", () => {
+    expect(evaluate({ changedBytes: 1_024, maxChangedBytes: 1_024 }).outcome)
+      .toBe("promoted");
+    expect(evaluate({ changedBytes: 1_025, maxChangedBytes: 1_024 }))
+      .toMatchObject({
+        outcome: "quarantined",
+        reason: "change_bytes_exceeded",
+        changedFiles: { changedBytes: 1_025 },
+        findings: [expect.objectContaining({ code: "change_bytes_exceeded" })],
+      });
+  });
+
+  it("discards a Run that exceeds its staging quota", () => {
+    expect(evaluate({ executionStatus: "quota_exceeded" })).toMatchObject({
+      outcome: "discarded",
+      reason: "staging_quota_exceeded",
+      findings: [expect.objectContaining({ code: "staging_quota_exceeded" })],
+    });
   });
 });
