@@ -12,6 +12,11 @@ describe("Container Codex runner", () => {
       ARK_API_KEY: "secret-that-must-not-appear-in-argv",
       ARK_MODEL: "ep-test",
       CODEX_HOME: "/tmp/codex-home",
+      AGENT_WORKSPACE_ROOT: "/tmp/workspaces",
+      CONTAINER_WORKSPACE_HOST_ROOT: "/host/workspaces",
+      CONTAINER_CODEX_HOME_HOST_ROOT: "/host/codex-home",
+      DEPENDENCY_CACHE_ROOT: "/tmp/dependencies",
+      DEPENDENCY_CACHE_HOST_ROOT: "/host/dependencies",
       RUNTIME_PROVIDER: "container",
       CONTAINER_ENGINE: "podman",
       CONTAINER_RUNTIME_IMAGE: "runtime:test",
@@ -21,9 +26,10 @@ describe("Container Codex runner", () => {
     const args = buildContainerRunArgs(
       {
         agentId: "agent/unsafe",
-        workspacePath: "/tmp/agent-workspace",
+        workspacePath: "/tmp/workspaces/.staging/run-1",
         prompt: "write a small program",
         threadId: null,
+        dependencyCachePath: `/host/dependencies/${"a".repeat(64)}/node_modules`,
       },
       config,
     );
@@ -32,8 +38,14 @@ describe("Container Codex runner", () => {
       "launchpad-test-instance-agent-unsafe",
     );
     expect(args).toContain("runtime:test");
-    expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace");
-    expect(args).toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");
+    expect(args).toContain(
+      "type=bind,src=/host/workspaces/.staging/run-1,dst=/workspace",
+    );
+    expect(args).toContain("type=bind,src=/host/codex-home,dst=/codex-home");
+    expect(args).toContain(
+      `type=bind,src=/host/dependencies/${"a".repeat(64)}/node_modules,dst=/workspace/node_modules,readonly`,
+    );
+    expect(args.slice(0, 5)).toEqual(["run", "--rm", "--pull", "never", "--init"]);
     expect(args).toContain("501:20");
     expect(args).toContain("workspace-write");
     expect(args).toContain("/workspace");
@@ -46,12 +58,13 @@ describe("Container Codex runner", () => {
     const config = loadConfig({
       NODE_ENV: "test",
       CODEX_HOME: "/tmp/codex-home",
+      AGENT_WORKSPACE_ROOT: "/tmp/workspaces",
       RUNTIME_PROVIDER: "container",
     });
     const args = buildContainerRunArgs(
       {
         agentId: "agent",
-        workspacePath: "/tmp/workspace",
+        workspacePath: "/tmp/workspaces/.staging/run-2",
         prompt: "continue",
         threadId: "thread-123",
       },

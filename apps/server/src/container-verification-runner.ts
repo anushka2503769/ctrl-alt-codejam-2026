@@ -2,6 +2,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
+import { validatedDependencyMountSource } from "./container-codex-runner.js";
 import { RunCancelledError } from "./errors.js";
 import {
   redactVerificationOutput,
@@ -45,6 +46,7 @@ export function verificationWorkspaceMountSource(
 export function buildVerificationContainerArgs(
   workspacePath: string,
   config: AppConfig,
+  dependencyCachePath: string | null = null,
 ): string[] {
   const name = verificationContainerName(workspacePath, config.runtimeInstanceId);
   const mountSource = verificationWorkspaceMountSource(workspacePath, config);
@@ -53,6 +55,9 @@ export function buildVerificationContainerArgs(
   const user = /^(?:0|root)(?::(?:0|root))?$/.test(configuredUser)
     ? "1000:1000"
     : configuredUser;
+  const dependencyMount = dependencyCachePath
+    ? validatedDependencyMountSource(dependencyCachePath, config)
+    : null;
   return [
     "run",
     "--rm",
@@ -107,6 +112,12 @@ export function buildVerificationContainerArgs(
     "SSH_AUTH_SOCK=",
     "--mount",
     `type=bind,src=${mountSource},dst=/workspace`,
+    ...(dependencyMount
+      ? [
+          "--mount",
+          `type=bind,src=${dependencyMount},dst=/workspace/node_modules,readonly`,
+        ]
+      : []),
     "--workdir",
     "/workspace",
     config.containerRuntimeImage,
@@ -130,7 +141,11 @@ export class ContainerVerificationRunner implements RunVaultVerificationRunner {
     );
     const child = spawn(
       this.config.containerEngine,
-      buildVerificationContainerArgs(workspacePath, this.config),
+      buildVerificationContainerArgs(
+        workspacePath,
+        this.config,
+        options.dependencyCachePath,
+      ),
       { env: this.engineEnvironment(), stdio: ["ignore", "pipe", "pipe"] },
     );
     let output = Buffer.alloc(0);

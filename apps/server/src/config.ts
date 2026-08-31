@@ -18,6 +18,18 @@ const envSchema = z.object({
   RUNTIME_PROVIDER: z.enum(["local-process", "container"]).default("local-process"),
   VERIFICATION_PROVIDER: z.enum(["container", "host"]).default("container"),
   VERIFICATION_WORKSPACE_HOST_ROOT: z.string().optional(),
+  CONTAINER_WORKSPACE_HOST_ROOT: z.string().optional(),
+  CONTAINER_CODEX_HOME_HOST_ROOT: z.string().optional(),
+  DEPENDENCY_MODE: z
+    .enum(["disabled", "existing-cache", "isolated-ci"])
+    .default("disabled"),
+  DEPENDENCY_CACHE_ROOT: z.string().optional(),
+  DEPENDENCY_CACHE_HOST_ROOT: z.string().optional(),
+  DEPENDENCY_PREPARATION_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(1_000)
+    .default(600_000),
   CONTAINER_ENGINE: z.string().min(1).default("docker"),
   CONTAINER_RUNTIME_IMAGE: z.string().min(1).default("volc-agent-runtime:local"),
   CONTAINER_CPU_LIMIT: z.coerce.number().positive().default(2),
@@ -51,12 +63,35 @@ const envSchema = z.object({
 
 export type AppConfig = ReturnType<typeof loadConfig>;
 
+function pathsOverlap(left: string, right: string): boolean {
+  const relative = path.relative(left, right);
+  const rightInsideLeft =
+    relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`));
+  const reverse = path.relative(right, left);
+  const leftInsideRight =
+    reverse === "" || (reverse !== ".." && !reverse.startsWith(`..${path.sep}`));
+  return rightInsideLeft || leftInsideRight;
+}
+
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const env = envSchema.parse(environment);
   if (env.NODE_ENV === "production" && env.VERIFICATION_PROVIDER === "host") {
     throw new Error("Host verification is not allowed in production");
   }
+  if (
+    env.DEPENDENCY_MODE !== "disabled" &&
+    (env.RUNTIME_PROVIDER !== "container" || env.VERIFICATION_PROVIDER !== "container")
+  ) {
+    throw new Error(
+      "Managed dependency modes require container Agent and verification providers",
+    );
+  }
   const authToken = env.APP_AUTH_TOKEN?.trim() ?? "";
+  if (env.DEPENDENCY_MODE === "isolated-ci" && authToken.length === 0) {
+    throw new Error(
+      "DEPENDENCY_MODE=isolated-ci requires APP_AUTH_TOKEN for authenticated preparation",
+    );
+  }
   const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
   if (env.NODE_ENV === "production" && !loopbackHosts.has(env.HOST)) {
     if (authToken.length < 24 || authToken.startsWith("replace-")) {
@@ -70,13 +105,43 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       ? process.getuid() + ":" + process.getgid()
       : "1000:1000";
   const workspaceRoot = path.resolve(env.AGENT_WORKSPACE_ROOT);
+  const dataDirectory = path.resolve(env.APP_DATA_DIR);
+  const codexHome = path.resolve(env.CODEX_HOME);
+  const dependencyCacheRoot = path.resolve(
+    env.DEPENDENCY_CACHE_ROOT?.trim() || path.join(dataDirectory, "dependencies"),
+  );
+  const containerWorkspaceHostRoot = path.resolve(
+    env.CONTAINER_WORKSPACE_HOST_ROOT?.trim() || workspaceRoot,
+  );
+  const containerCodexHomeHostRoot = path.resolve(
+    env.CONTAINER_CODEX_HOME_HOST_ROOT?.trim() || codexHome,
+  );
+  const dependencyCacheHostRoot = path.resolve(
+    env.DEPENDENCY_CACHE_HOST_ROOT?.trim() || dependencyCacheRoot,
+  );
+  if (
+    pathsOverlap(dependencyCacheRoot, workspaceRoot) ||
+    pathsOverlap(dependencyCacheRoot, codexHome)
+  ) {
+    throw new Error(
+      "Dependency cache root must be separate from workspace and Codex roots",
+    );
+  }
+  if (
+    pathsOverlap(dependencyCacheHostRoot, containerWorkspaceHostRoot) ||
+    pathsOverlap(dependencyCacheHostRoot, containerCodexHomeHostRoot)
+  ) {
+    throw new Error(
+      "Dependency cache host root must be separate from host workspace and Codex roots",
+    );
+  }
   return {
     host: env.HOST,
     port: env.PORT,
     logLevel: env.LOG_LEVEL,
-    dataDirectory: path.resolve(env.APP_DATA_DIR),
+    dataDirectory,
     workspaceRoot,
-    codexHome: path.resolve(env.CODEX_HOME),
+    codexHome,
     codexBin: env.CODEX_BIN,
     codexSandboxMode: env.CODEX_SANDBOX_MODE,
     codexTimeoutMs: env.CODEX_TIMEOUT_MS,
@@ -86,6 +151,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     verificationWorkspaceHostRoot: path.resolve(
       env.VERIFICATION_WORKSPACE_HOST_ROOT?.trim() || workspaceRoot,
     ),
+    containerWorkspaceHostRoot,
+    containerCodexHomeHostRoot,
+    dependencyMode: env.DEPENDENCY_MODE,
+    dependencyCacheRoot,
+    dependencyCacheHostRoot,
+    dependencyPreparationTimeoutMs: env.DEPENDENCY_PREPARATION_TIMEOUT_MS,
     containerEngine: env.CONTAINER_ENGINE,
     containerRuntimeImage: env.CONTAINER_RUNTIME_IMAGE,
     containerCpuLimit: env.CONTAINER_CPU_LIMIT,

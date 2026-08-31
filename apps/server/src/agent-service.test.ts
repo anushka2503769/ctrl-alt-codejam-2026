@@ -8,9 +8,14 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentService } from "./agent-service.js";
 import { loadConfig } from "./config.js";
+import {
+  DependencyCacheUnavailableError,
+  DependencyManager,
+  type DependencyResolution,
+} from "./dependency-manager.js";
 import { RunCancelledError, RunTimedOutError } from "./errors.js";
 import { RunVaultVerifier } from "./runvault-verifier.js";
 import { JsonStore } from "./store.js";
@@ -80,6 +85,7 @@ async function makeServiceHarness(
   createRunVaultWorkspaces: (workspaceRoot: string) => RunVaultWorkspaceManager =
     (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
   verifier?: RunVaultVerifier,
+  dependencies?: DependencyManager,
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
   temporaryDirectories.push(root);
@@ -103,6 +109,7 @@ async function makeServiceHarness(
     runner,
     runVaultWorkspaces,
     verifier,
+    dependencies,
   );
   await service.initialize();
   return { config, root, runVaultWorkspaces, service, store };
@@ -115,6 +122,20 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
 async function trustedFingerprint(workspacePath: string): Promise<string> {
   const manager = new RunVaultWorkspaceManager(path.dirname(workspacePath));
   return (await manager.snapshotWorkspace(workspacePath)).fingerprint;
+}
+
+function fakeDependencyManager(
+  resolve: (workspacePath: string) => Promise<DependencyResolution>,
+  prepare = async () => ({
+    status: "prepared" as const,
+    cacheKey: "a".repeat(64),
+  }),
+): DependencyManager {
+  return {
+    initialize: async () => undefined,
+    resolve,
+    prepare,
+  } as unknown as DependencyManager;
 }
 
 describe("Agent lifecycle", () => {
@@ -142,6 +163,208 @@ describe("Agent lifecycle", () => {
     expect(service.getRun(run.id).runVault).toMatchObject({
       outcome: "promoted",
       reason: "verified_safe",
+    });
+  });
+
+  it("passes the same managed dependency cache to Agent and verification", async () => {
+    const cachePath = `/host/dependencies/${"a".repeat(64)}/node_modules`;
+    const requests: RunnerRequest[] = [];
+    const verificationOptions: Array<{ dependencyCachePath: string | null }> = [];
+    const runner: AgentRunner = {
+      run: async (request) => {
+        requests.push(request);
+        return { output: "done", threadId: "dependency-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const verifier = new RunVaultVerifier({
+      runner: {
+        run: async (_workspacePath, options) => {
+          verificationOptions.push(options);
+          return {
+            status: "passed",
+            command: "npm test",
+            redactedSummary: "passed",
+            exitCode: 0,
+            timedOut: false,
+          };
+        },
+      },
+    });
+    const dependencies = fakeDependencyManager(async () => ({
+      status: "available",
+      cacheKey: "a".repeat(64),
+      mountPath: cachePath,
+      message: "available",
+    }));
+    const harness = await makeServiceHarness(
+      runner,
+      undefined,
+      verifier,
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Cache user" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test" } }),
+    );
+    await writeFile(
+      path.join(agent.workspacePath, "package-lock.json"),
+      JSON.stringify({ lockfileVersion: 3 }),
+    );
+
+    const { run } = await harness.service.sendMessage(agent.id, "use dependencies");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    expect(requests[0]?.dependencyCachePath).toBe(cachePath);
+    expect(verificationOptions[0]?.dependencyCachePath).toBe(cachePath);
+  });
+
+  it("fails before Agent execution when a required cache is missing", async () => {
+    const run = vi.fn(async () => ({
+      output: "should not run",
+      threadId: "unexpected-thread",
+      usage: null,
+    }));
+    const dependencies = fakeDependencyManager(async () => ({
+      status: "missing",
+      cacheKey: "b".repeat(64),
+      mountPath: null,
+      message: "No matching managed dependency cache is prepared.",
+    }));
+    const harness = await makeServiceHarness(
+      { run, cancel: async () => false, isAvailable: async () => true },
+      undefined,
+      undefined,
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Missing cache" });
+    const result = await harness.service.sendMessage(agent.id, "run");
+    await expect.poll(() => harness.service.getRun(result.run.id).status).toBe("failed");
+
+    expect(run).not.toHaveBeenCalled();
+    expect(harness.service.getRun(result.run.id).error).toContain(
+      "Prepare dependencies explicitly",
+    );
+  });
+
+  it("prepares dependencies explicitly and releases the Agent reservation", async () => {
+    const prepare = vi.fn(async () => ({
+      status: "prepared" as const,
+      cacheKey: "d".repeat(64),
+    }));
+    const dependencies = fakeDependencyManager(
+      async () => ({
+        status: "missing",
+        cacheKey: "d".repeat(64),
+        mountPath: null,
+        message: "missing",
+      }),
+      prepare,
+    );
+    const harness = await makeServiceHarness(
+      undefined,
+      undefined,
+      undefined,
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Preparer" });
+
+    await expect(
+      harness.service.prepareDependencies(agent.id, true),
+    ).resolves.toEqual({ status: "prepared", cacheKey: "d".repeat(64) });
+    expect(prepare).toHaveBeenCalledWith(agent.workspacePath, true);
+    expect(harness.service.getAgent(agent.id).status).toBe("ready");
+  });
+
+  it("returns a client error when dependency preparation cannot describe manifests", async () => {
+    const dependencies = fakeDependencyManager(
+      async () => ({
+        status: "missing",
+        cacheKey: null,
+        mountPath: null,
+        message: "missing",
+      }),
+      async () => {
+        throw new DependencyCacheUnavailableError("package.json could not be parsed");
+      },
+    );
+    const harness = await makeServiceHarness(
+      undefined,
+      undefined,
+      undefined,
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Bad manifest" });
+
+    await expect(harness.service.prepareDependencies(agent.id, true)).rejects
+      .toMatchObject({ statusCode: 409 });
+    expect(harness.service.getAgent(agent.id).status).toBe("ready");
+  });
+
+  it("never verifies with stale dependencies after a lockfile change", async () => {
+    let resolutionCall = 0;
+    const dependencies = fakeDependencyManager(async () => {
+      resolutionCall += 1;
+      return resolutionCall === 1
+        ? {
+            status: "available" as const,
+            cacheKey: "a".repeat(64),
+            mountPath: `/cache/${"a".repeat(64)}/node_modules`,
+            message: "available",
+          }
+        : {
+            status: "missing" as const,
+            cacheKey: "b".repeat(64),
+            mountPath: null,
+            message: "No matching managed dependency cache is prepared.",
+          };
+    });
+    const verify = vi.fn(async () => ({
+      status: "passed" as const,
+      command: "npm test",
+      redactedSummary: "passed",
+      exitCode: 0,
+      timedOut: false,
+    }));
+    const runner: AgentRunner = {
+      run: async (request) => {
+        await writeFile(
+          path.join(request.workspacePath, "package-lock.json"),
+          JSON.stringify({ lockfileVersion: 3, changed: true }),
+        );
+        return { output: "updated lock", threadId: "lock-thread", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const harness = await makeServiceHarness(
+      runner,
+      undefined,
+      new RunVaultVerifier({ runner: { run: verify } }),
+      dependencies,
+    );
+    const agent = await harness.service.createAgent({ name: "Lock updater" });
+    await writeFile(
+      path.join(agent.workspacePath, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test" } }),
+    );
+    await writeFile(
+      path.join(agent.workspacePath, "package-lock.json"),
+      JSON.stringify({ lockfileVersion: 3 }),
+    );
+
+    const { run } = await harness.service.sendMessage(agent.id, "update lock");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    expect(verify).not.toHaveBeenCalled();
+    expect(harness.service.getRun(run.id).runVault).toMatchObject({
+      outcome: "quarantined",
+      verification: {
+        status: "skipped",
+        redactedSummary: expect.stringContaining("stale dependencies"),
+      },
     });
   });
 
@@ -705,7 +928,7 @@ describe("Agent lifecycle", () => {
     await expect(service.approveRun(run.id)).rejects.toMatchObject({
       statusCode: 409,
       message:
-        "Agent-created Git metadata cannot be approved; request a revision that removes it",
+        "Agent-created Git or dependency metadata cannot be approved; request a revision that removes it",
     });
     await expect(lstat(path.join(agent.workspacePath, ".git"))).rejects
       .toMatchObject({ code: "ENOENT" });

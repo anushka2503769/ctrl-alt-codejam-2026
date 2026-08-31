@@ -137,4 +137,55 @@ describe.skipIf(!enabled)("container verification integration", () => {
       ]),
     ).rejects.toBeDefined();
   }, 20_000);
+
+  it("mounts managed dependencies read-only during offline verification", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "runvault-dependency-mount-"));
+    temporaryDirectories.push(root);
+    const workspaceRoot = path.join(root, "workspaces");
+    const workspace = path.join(workspaceRoot, ".staging", "run");
+    const cacheRoot = path.join(root, "dependencies");
+    const cacheKey = "a".repeat(64);
+    const dependencyPath = path.join(cacheRoot, cacheKey, "node_modules");
+    const fixturePath = path.join(dependencyPath, "fixture", "index.js");
+    await mkdir(path.dirname(fixturePath), { recursive: true });
+    await mkdir(workspace, { recursive: true });
+    await chmod(workspace, 0o777);
+    await writeFile(fixturePath, "module.exports = 'managed';\n");
+    const script = [
+      "const fs=require('fs');",
+      "const resolved=require.resolve('fixture');",
+      "if(require('fixture')!=='managed')process.exit(2);",
+      "try{fs.writeFileSync(resolved,'tampered');process.exit(3)}catch{}",
+      "fs.writeFileSync('dependency-verification-marker','readonly');",
+    ].join("");
+    await writeFile(
+      path.join(workspace, "package.json"),
+      JSON.stringify({ scripts: { test: `node -e ${JSON.stringify(script)}` } }),
+    );
+    const config = loadConfig({
+      NODE_ENV: "test",
+      AGENT_WORKSPACE_ROOT: workspaceRoot,
+      DEPENDENCY_CACHE_ROOT: cacheRoot,
+      DEPENDENCY_CACHE_HOST_ROOT: cacheRoot,
+      CONTAINER_ENGINE: "docker",
+      CONTAINER_RUNTIME_IMAGE: "volc-agent-runtime:local",
+    });
+    const verifier = new RunVaultVerifier({
+      timeoutMs: 10_000,
+      runner: new ContainerVerificationRunner(config),
+    });
+
+    const result = await verifier.verify(workspace, undefined, dependencyPath);
+
+    expect(result, result.redactedSummary).toMatchObject({
+      status: "passed",
+      exitCode: 0,
+    });
+    await expect(readFile(fixturePath, "utf8")).resolves.toBe(
+      "module.exports = 'managed';\n",
+    );
+    await expect(
+      readFile(path.join(workspace, "dependency-verification-marker"), "utf8"),
+    ).resolves.toBe("readonly");
+  }, 20_000);
 });

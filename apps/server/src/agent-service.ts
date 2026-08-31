@@ -2,6 +2,13 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import {
+  DependencyCacheUnavailableError,
+  DependencyManager,
+  DependencyPreparationError,
+  type DependencyResolution,
+} from "./dependency-manager.js";
+import { createDependencyManager } from "./dependency-factory.js";
+import {
   HttpError,
   RunCancelledError,
   RunTimedOutError,
@@ -66,6 +73,19 @@ function verificationEvidence(
   };
 }
 
+function dependencyMountForRun(resolution: DependencyResolution): string | null {
+  if (resolution.status === "available") return resolution.mountPath;
+  if (
+    resolution.status === "disabled" ||
+    resolution.status === "not_applicable"
+  ) {
+    return null;
+  }
+  throw new DependencyCacheUnavailableError(
+    `${resolution.message} Prepare dependencies explicitly before starting the Run.`,
+  );
+}
+
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<unknown>>();
   private readonly cancellationRequests = new Set<string>();
@@ -80,12 +100,14 @@ export class AgentService {
       config.workspaceRoot,
     ),
     private readonly verifier = createVerifier(config),
+    private readonly dependencies = createDependencyManager(config),
   ) {}
 
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
     await this.runVaultWorkspaces.initialize();
+    await this.dependencies.initialize();
     await this.store.mutate((database) => {
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
@@ -258,6 +280,51 @@ export class AgentService {
     this.getAgent(id);
     await this.cancelExecution(id);
     return this.setStatus(id, "stopped");
+  }
+
+  async prepareDependencies(
+    id: string,
+    confirmNetworkAccess: boolean,
+  ): Promise<{ status: "prepared" | "already_available"; cacheKey: string }> {
+    const reservation = await this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === id);
+      if (!agent) throw new HttpError(404, "Agent not found");
+      if (agent.status === "busy") {
+        throw new HttpError(409, "Wait for the active Agent operation to finish");
+      }
+      const previousStatus = agent.status;
+      agent.status = "busy";
+      agent.lastError = null;
+      agent.updatedAt = now();
+      return { agent: structuredClone(agent), previousStatus };
+    });
+    const operation = this.dependencies.prepare(
+      reservation.agent.workspacePath,
+      confirmNetworkAccess,
+    );
+    this.activeExecutions.set(id, operation);
+    try {
+      return await operation;
+    } catch (error) {
+      if (
+        error instanceof DependencyPreparationError ||
+        error instanceof DependencyCacheUnavailableError
+      ) {
+        throw new HttpError(409, error.message);
+      }
+      throw error;
+    } finally {
+      if (this.activeExecutions.get(id) === operation) {
+        this.activeExecutions.delete(id);
+      }
+      await this.store.mutate((database) => {
+        const agent = database.agents.find((item) => item.id === id);
+        if (agent?.status === "busy") {
+          agent.status = reservation.previousStatus;
+          agent.updatedAt = now();
+        }
+      });
+    }
   }
 
   getMessages(agentId: string): Message[] {
@@ -699,6 +766,7 @@ export class AgentService {
       arkModel: this.config.arkModel || null,
       codexAvailable: await this.runner.isAvailable(),
       codexSandboxMode: this.config.codexSandboxMode,
+      dependencyMode: this.config.dependencyMode,
       runtimeProvider: this.config.runtimeProvider,
       containerEngine:
         this.config.runtimeProvider === "container"
@@ -748,11 +816,14 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+      const initialDependencies = await this.dependencies.resolve(staging.path);
+      const initialDependencyMount = dependencyMountForRun(initialDependencies);
       runnerResult = await this.runner.run({
         agentId: agentAtStart.id,
         workspacePath: staging.path,
         prompt: run.prompt,
         threadId: revision?.baseThreadId ?? agentAtStart.codexThreadId,
+        dependencyCachePath: initialDependencyMount,
       });
       if (runnerResult.threadId === (revision?.baseThreadId ?? agentAtStart.codexThreadId)) {
         throw new Error("Codex did not create a distinct provisional thread");
@@ -765,16 +836,57 @@ export class AgentService {
         staging.trustedSnapshot,
         staging.path,
       );
+      const dependencyFilesChanged = beforeVerification.changes.some(
+        (change) => change.dependencyFile,
+      );
+      let verificationDependencyMount: string | null = null;
+      let dependencyVerificationBlocked = false;
+      let verificationDependencies: DependencyResolution | null = null;
+      try {
+        verificationDependencies = await this.dependencies.resolve(staging.path);
+      } catch (error) {
+        if (
+          !dependencyFilesChanged ||
+          !(error instanceof DependencyCacheUnavailableError)
+        ) {
+          throw error;
+        }
+        dependencyVerificationBlocked = true;
+        verification = skippedVerification(
+          `${error.message} Verification cannot use stale dependencies after dependency files changed.`,
+        );
+      }
+      if (verificationDependencies?.status === "available") {
+        verificationDependencyMount = verificationDependencies.mountPath;
+      } else if (
+        verificationDependencies &&
+        verificationDependencies.status !== "disabled"
+      ) {
+        if (dependencyFilesChanged) {
+          dependencyVerificationBlocked = true;
+          verification = skippedVerification(
+            `${verificationDependencies.message} Verification cannot use stale dependencies after dependency files changed.`,
+          );
+        } else if (verificationDependencies.status !== "not_applicable") {
+          throw new DependencyCacheUnavailableError(
+            `${verificationDependencies.message} Managed dependencies became unavailable before verification.`,
+          );
+        }
+      }
       if (beforeVerification.changes.some((change) => change.symbolicLink)) {
         verification = skippedVerification(
           "Verification was skipped because the staged workspace introduced a symbolic link.",
         );
-      } else {
+      } else if (!dependencyVerificationBlocked) {
         const controller = new AbortController();
         this.verificationControllers.set(agentAtStart.id, controller);
         try {
           verification = verificationEvidence(
-            await this.verifier.verify(staging.path, controller.signal),
+            await this.verifier.verify(
+              staging.path,
+              controller.signal,
+              verificationDependencyMount,
+            ),
           );
         } finally {
           if (this.verificationControllers.get(agentAtStart.id) === controller) {
@@ -1181,7 +1293,7 @@ export class AgentService {
       if (error instanceof UnsafeWorkspaceEntryError) {
         throw new HttpError(
           409,
-          "Agent-created Git metadata cannot be approved; request a revision that removes it",
+          "Agent-created Git or dependency metadata cannot be approved; request a revision that removes it",
         );
       }
       if (error instanceof RunCancelledError) {

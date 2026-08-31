@@ -184,6 +184,7 @@ export interface RunnerRequest {
   workspacePath: string;
   prompt: string;
   threadId: string | null;
+  dependencyCachePath?: string | null;
 }
 
 export interface AgentRunner {

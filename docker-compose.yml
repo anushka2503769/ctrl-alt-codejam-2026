@@ -35,6 +35,10 @@ services:
       AGENT_WORKSPACE_ROOT: /app/workspaces
       VERIFICATION_PROVIDER: container
       VERIFICATION_WORKSPACE_HOST_ROOT: ${PWD}/workspaces
+      CONTAINER_WORKSPACE_HOST_ROOT: ${PWD}/workspaces
+      CONTAINER_CODEX_HOME_HOST_ROOT: ${PWD}/codex-home
+      DEPENDENCY_CACHE_ROOT: /app/data/dependencies
+      DEPENDENCY_CACHE_HOST_ROOT: ${PWD}/data/dependencies
       CONTAINER_ENGINE: /usr/local/bin/docker
       DOCKER_HOST: unix:///var/run/docker.sock
       CODEX_HOME: /app/codex-home

@@ -24,6 +24,14 @@ credentials, personal data, or exploit details in an issue.
 - Trusted `.git` files and directories are not copied or content-hashed.
   Agent-created `.git` metadata is quarantined and cannot be approved; durable
   promotion recovery preserves trusted repository metadata separately.
+- `node_modules` is not copied, content-hashed, or promoted as source. Existing
+  trusted trees are preserved but never mounted into Runs. Optional managed
+  caches are content-keyed and mounted read-only; RunVault never automatically
+  installs packages during Agent or verification Runs.
+- `DEPENDENCY_MODE=isolated-ci` exposes an authenticated preparation endpoint.
+  Each request requires an explicit network confirmation and runs constrained
+  `npm ci --ignore-scripts`; registry packages remain untrusted executable code
+  when later imported by an Agent or test process.
 - Broad outbound network access
 - Prompt-triggered command and file execution
 - Ark key available to the server and active Runtime container

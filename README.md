@@ -127,6 +127,33 @@ Update deploy/production.yml with a new production rollout configuration.
 RunVault shows the protected path and verification metadata, but never displays
 the protected file's contents in its decision evidence.
 
+### Optional managed npm dependencies
+
+RunVault never copies, hashes, or promotes `node_modules`. Existing trusted
+trees are preserved across workspace swaps for compatibility, but Agent and
+verification containers can access dependencies only through an immutable
+managed cache mounted read-only.
+
+The default `DEPENDENCY_MODE=disabled` performs no dependency preparation. To
+require previously prepared caches, use `existing-cache`. To allow explicit
+preparation, use `isolated-ci` together with container Agent and verification
+providers and a non-empty `APP_AUTH_TOKEN`. Preparation is never automatic: an
+authenticated caller must opt in to network access for one Agent workspace:
+
+```bash
+curl --fail --request POST \
+  --header "Authorization: Bearer $APP_AUTH_TOKEN" \
+  --header "Content-Type: application/json" \
+  --data '{"confirmNetworkAccess":true}' \
+  "http://127.0.0.1:3000/api/agents/AGENT_ID/dependencies/prepare"
+```
+
+That endpoint runs `npm ci --ignore-scripts --no-audit --no-fund` in a
+resource-limited preparation container. RunVault never automatically installs
+packages during Agent Runs, and verification remains offline. Changing
+`package.json` or `package-lock.json`
+changes the cache key; stale dependencies are not reused.
+
 ### 5. Stop and resume
 
 Press `Ctrl+C` in the startup terminal. The script removes temporary Runtime
@@ -238,6 +265,11 @@ cp deploy/volcengine/terraform.tfvars.example \
 | `RUNTIME_PROVIDER` | `local-process` | `container` for disposable local Runtime containers. |
 | `VERIFICATION_PROVIDER` | `container` | `host` is an explicit development/test-only fallback and is rejected in production. |
 | `VERIFICATION_WORKSPACE_HOST_ROOT` | Workspace root | Host-side workspace path when the server runs inside a container. |
+| `CONTAINER_WORKSPACE_HOST_ROOT` | Workspace root | Host-side staging root used by container Agent Runs. |
+| `CONTAINER_CODEX_HOME_HOST_ROOT` | Codex home | Host-side Codex home used by container Agent Runs. |
+| `DEPENDENCY_MODE` | `disabled` | `existing-cache` requires prepared caches; `isolated-ci` also enables explicit preparation. |
+| `DEPENDENCY_CACHE_ROOT` | Data directory + `dependencies` | Control-plane path for immutable dependency caches. |
+| `DEPENDENCY_CACHE_HOST_ROOT` | Cache root | Host-side cache path used for container mounts. |
 | `CONTAINER_RUNTIME_IMAGE` | `volc-agent-runtime:local` | Prebuilt image used for Agent and verification containers. |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | Codex inner sandbox mode. |
 | `CODEX_TIMEOUT_MS` | `600000` | Maximum duration of one turn. |

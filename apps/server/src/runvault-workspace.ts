@@ -24,8 +24,11 @@ import type { Database, RunVaultFileChange } from "./types.js";
 
 const PLATFORM_RESERVED_DIRECTORY_NAMES = new Set([".codex", ".staging"]);
 const GIT_METADATA_NAME = ".git";
+const DEPENDENCY_METADATA_NAME = "node_modules";
 const MAX_GIT_METADATA_PATHS = 1_024;
+const MAX_DEPENDENCY_METADATA_PATHS = 1_024;
 const MAX_GIT_METADATA_PATH_BYTES = 4_096;
+const MAX_DEPENDENCY_METADATA_PATH_BYTES = 4_096;
 const BINARY_EXTENSIONS = new Set([
   ".class",
   ".dll",
@@ -88,6 +91,7 @@ export interface WorkspaceSnapshot {
   entryCount: number;
   estimatedBytes: number;
   gitMetadataPaths: string[];
+  dependencyMetadataPaths: string[];
 }
 
 export interface StagingWorkspaceMetrics {
@@ -116,7 +120,8 @@ export interface RunVaultPromotion {
   backupWorkspacePath: string;
   markerPath: string;
   gitMetadataPaths: string[];
-  markerVersion: 1 | 2;
+  dependencyMetadataPaths: string[];
+  markerVersion: 1 | 2 | 3;
 }
 
 export type ReviewFileResult =
@@ -144,7 +149,16 @@ interface PromotionMarkerV2 {
   gitMetadataPaths: string[];
 }
 
-type PromotionMarker = PromotionMarkerV1 | PromotionMarkerV2;
+interface PromotionMarkerV3 {
+  version: 3;
+  runId: string;
+  agentId: string;
+  phase: PromotionPhase;
+  gitMetadataPaths: string[];
+  dependencyMetadataPaths: string[];
+}
+
+type PromotionMarker = PromotionMarkerV1 | PromotionMarkerV2 | PromotionMarkerV3;
 
 export class UnsafeWorkspaceEntryError extends Error {}
 export class TrustedWorkspaceChangedError extends Error {}
@@ -183,10 +197,13 @@ function isPromotionMarker(value: unknown): value is PromotionMarker {
       marker.phase === "committed"
     );
   }
-  if (marker.version !== 2 || !Array.isArray(marker.gitMetadataPaths)) {
+  if (
+    (marker.version !== 2 && marker.version !== 3) ||
+    !Array.isArray(marker.gitMetadataPaths)
+  ) {
     return false;
   }
-  return (
+  const gitMetadataValid =
     (marker.phase === "prepared" ||
       marker.phase === "installed" ||
       marker.phase === "metadata_installed" ||
@@ -196,7 +213,19 @@ function isPromotionMarker(value: unknown): value is PromotionMarker {
       (candidate) =>
         typeof candidate === "string" && isValidGitMetadataPath(candidate),
     ) &&
-    new Set(marker.gitMetadataPaths).size === marker.gitMetadataPaths.length
+    new Set(marker.gitMetadataPaths).size === marker.gitMetadataPaths.length;
+  if (!gitMetadataValid || marker.version === 2) return gitMetadataValid;
+  const dependencyMetadataPaths = (marker as Partial<PromotionMarkerV3>)
+    .dependencyMetadataPaths;
+  return (
+    Array.isArray(dependencyMetadataPaths) &&
+    dependencyMetadataPaths.length <= MAX_DEPENDENCY_METADATA_PATHS &&
+    dependencyMetadataPaths.every(
+      (candidate: unknown) =>
+        typeof candidate === "string" &&
+        isValidDependencyMetadataPath(candidate),
+    ) &&
+    new Set(dependencyMetadataPaths).size === dependencyMetadataPaths.length
   );
 }
 
@@ -216,12 +245,32 @@ function isGitMetadataPath(relativePath: string): boolean {
   return pathSegments(relativePath).some(isGitMetadataName);
 }
 
+function isDependencyMetadataName(name: string): boolean {
+  return name.toLowerCase() === DEPENDENCY_METADATA_NAME;
+}
+
+function isDependencyMetadataPath(relativePath: string): boolean {
+  return pathSegments(relativePath).some(isDependencyMetadataName);
+}
+
 function isValidGitMetadataPath(relativePath: string): boolean {
   try {
     return (
       validateReviewPath(relativePath) === relativePath &&
       Buffer.byteLength(relativePath) <= MAX_GIT_METADATA_PATH_BYTES &&
       isGitMetadataName(path.posix.basename(relativePath))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isValidDependencyMetadataPath(relativePath: string): boolean {
+  try {
+    return (
+      validateReviewPath(relativePath) === relativePath &&
+      Buffer.byteLength(relativePath) <= MAX_DEPENDENCY_METADATA_PATH_BYTES &&
+      isDependencyMetadataName(path.posix.basename(relativePath))
     );
   } catch {
     return false;
@@ -235,6 +284,7 @@ function shouldExcludeFromCopy(
   const segments = pathSegments(relativePath);
   return (
     segments.some((segment) => PLATFORM_RESERVED_DIRECTORY_NAMES.has(segment)) ||
+    segments.some(isDependencyMetadataName) ||
     (excludeGitMetadata && segments.some(isGitMetadataName))
   );
 }
@@ -243,6 +293,7 @@ export function isProtectedRunVaultPath(relativePath: string): boolean {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\//, "");
   return (
     isGitMetadataPath(normalized) ||
+    isDependencyMetadataPath(normalized) ||
     normalized === ".env" ||
     normalized.startsWith(".env.") ||
     normalized === ".codex" ||
@@ -263,6 +314,7 @@ export function isDependencyFile(relativePath: string): boolean {
   const normalized = relativePath.replaceAll("\\", "/");
   const basename = path.posix.basename(normalized).toLowerCase();
   return (
+    isDependencyMetadataPath(normalized) ||
     DEPENDENCY_FILE_NAMES.has(basename) ||
     /^requirements(?:[._-].+)?\.txt$/.test(basename)
   );
@@ -313,6 +365,8 @@ async function collectEntries(
     excludePlatformMetadata: boolean;
     excludeGitMetadata: boolean;
     collapseGitMetadata: boolean;
+    excludeDependencyMetadata: boolean;
+    collapseDependencyMetadata: boolean;
   },
 ): Promise<void> {
   const children = await readdir(current, { withFileTypes: true });
@@ -329,6 +383,12 @@ async function collectEntries(
       continue;
     }
     if (options.excludeGitMetadata && isGitMetadataPath(relativePath)) continue;
+    if (
+      options.excludeDependencyMetadata &&
+      isDependencyMetadataPath(relativePath)
+    ) {
+      continue;
+    }
 
     const stats = await lstat(absolutePath);
     if (isGitMetadataName(child.name) && options.collapseGitMetadata) {
@@ -366,6 +426,24 @@ async function collectEntries(
         });
         continue;
       }
+    }
+    if (
+      isDependencyMetadataName(child.name) &&
+      options.collapseDependencyMetadata
+    ) {
+      entries.push({
+        path: relativePath,
+        type: stats.isDirectory()
+          ? "directory"
+          : stats.isFile()
+            ? "file"
+            : "symbolic-link",
+        digest: `dependency-metadata:${stats.isFile() ? stats.size : 0}`,
+        mode: stats.mode & 0o777,
+        binary: true,
+        size: stats.isFile() ? stats.size : 0,
+      });
+      continue;
     }
     if (stats.isDirectory()) {
       entries.push({
@@ -501,7 +579,7 @@ async function collectGitMetadataPaths(
     if (
       pathSegments(relativePath).some((segment) =>
         PLATFORM_RESERVED_DIRECTORY_NAMES.has(segment),
-      )
+      ) || isDependencyMetadataPath(relativePath)
     ) {
       continue;
     }
@@ -522,6 +600,46 @@ async function collectGitMetadataPaths(
     }
     if (stats.isDirectory()) {
       await collectGitMetadataPaths(root, candidate, results);
+    }
+  }
+  return results;
+}
+
+async function collectDependencyMetadataPaths(
+  root: string,
+  current: string = root,
+  results: string[] = [],
+): Promise<string[]> {
+  const children = await readdir(current, { withFileTypes: true });
+  children.sort((left, right) => left.name.localeCompare(right.name));
+
+  for (const child of children) {
+    const candidate = path.join(current, child.name);
+    const relativePath = toRelativePath(root, candidate);
+    if (
+      pathSegments(relativePath).some((segment) =>
+        PLATFORM_RESERVED_DIRECTORY_NAMES.has(segment),
+      ) || isGitMetadataPath(relativePath)
+    ) {
+      continue;
+    }
+    const stats = await lstat(candidate);
+    if (isDependencyMetadataName(child.name)) {
+      if (!stats.isDirectory()) {
+        throw new UnsafeWorkspaceEntryError(
+          `Dependency metadata must be a directory at ${relativePath}`,
+        );
+      }
+      results.push(relativePath);
+      if (results.length > MAX_DEPENDENCY_METADATA_PATHS) {
+        throw new UnsafeWorkspaceEntryError(
+          `Workspace contains more than ${MAX_DEPENDENCY_METADATA_PATHS} dependency metadata paths`,
+        );
+      }
+      continue;
+    }
+    if (stats.isDirectory()) {
+      await collectDependencyMetadataPaths(root, candidate, results);
     }
   }
   return results;
@@ -593,6 +711,79 @@ async function assertGitMetadataInventory(
   }
 }
 
+async function moveDependencyMetadataPaths(
+  sourceRoot: string,
+  destinationRoot: string,
+  relativePaths: string[],
+): Promise<void> {
+  for (const relativePath of relativePaths) {
+    if (!isValidDependencyMetadataPath(relativePath)) {
+      throw new Error("Invalid dependency metadata path in promotion");
+    }
+    const source = path.join(sourceRoot, ...relativePath.split("/"));
+    const destination = path.join(destinationRoot, ...relativePath.split("/"));
+    const sourceExists = await pathExists(source);
+    const destinationExists = await pathExists(destination);
+    if (sourceExists && destinationExists) {
+      throw new Error(
+        `RunVault found conflicting dependency metadata at ${relativePath}`,
+      );
+    }
+    if (!sourceExists) {
+      if (destinationExists) continue;
+      throw new Error(
+        `RunVault cannot recover dependency metadata at ${relativePath}`,
+      );
+    }
+    const destinationParent = path.dirname(destination);
+    let parentStats;
+    try {
+      parentStats = await lstat(destinationParent);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new UnsafeWorkspaceEntryError(
+          `Cannot preserve nested dependency metadata because its parent was removed: ${relativePath}`,
+        );
+      }
+      throw error;
+    }
+    if (!parentStats.isDirectory()) {
+      throw new UnsafeWorkspaceEntryError(
+        `Cannot preserve dependency metadata under a non-directory path: ${relativePath}`,
+      );
+    }
+    await rename(source, destination);
+  }
+}
+
+async function assertDependencyMetadataInventory(
+  promotion: RunVaultPromotion,
+): Promise<void> {
+  const discovered = new Set<string>();
+  for (const root of [
+    promotion.backupWorkspacePath,
+    promotion.trustedWorkspacePath,
+  ]) {
+    if (!(await pathExists(root))) continue;
+    for (const relativePath of await collectDependencyMetadataPaths(root)) {
+      if (discovered.has(relativePath)) {
+        throw new Error(
+          `RunVault found duplicate dependency metadata during promotion: ${relativePath}`,
+        );
+      }
+      discovered.add(relativePath);
+    }
+  }
+  const expected = [...promotion.dependencyMetadataPaths].sort();
+  const actual = [...discovered].sort();
+  if (
+    actual.length !== expected.length ||
+    actual.some((item, index) => item !== expected[index])
+  ) {
+    throw new Error("Trusted dependency metadata changed during promotion");
+  }
+}
+
 function entriesEqual(
   left: WorkspaceEntrySnapshot,
   right: WorkspaceEntrySnapshot,
@@ -641,6 +832,8 @@ export class RunVaultWorkspaceManager {
         excludePlatformMetadata: trustedWorkspace,
         excludeGitMetadata: trustedWorkspace,
         collapseGitMetadata: !trustedWorkspace,
+        excludeDependencyMetadata: trustedWorkspace,
+        collapseDependencyMetadata: !trustedWorkspace,
       },
     );
     const gitMetadataPaths = trustedWorkspace
@@ -648,12 +841,18 @@ export class RunVaultWorkspaceManager {
       : entries
           .filter((entry) => isGitMetadataPath(entry.path))
           .map((entry) => entry.path);
+    const dependencyMetadataPaths = trustedWorkspace
+      ? await collectDependencyMetadataPaths(resolvedPath)
+      : entries
+          .filter((entry) => isDependencyMetadataPath(entry.path))
+          .map((entry) => entry.path);
     return {
       entries,
       fingerprint: fingerprintEntries(entries),
       entryCount: entries.length,
       estimatedBytes: entries.reduce((total, entry) => total + entry.size, 0),
       gitMetadataPaths,
+      dependencyMetadataPaths,
     };
   }
 
@@ -775,7 +974,12 @@ export class RunVaultWorkspaceManager {
       const after = stagingByPath.get(relativePath);
       if (before?.type === "directory" && after?.type === "directory") continue;
       if (before && after && entriesEqual(before, after)) continue;
-      if (!before && after?.type === "directory" && !isGitMetadataPath(relativePath)) {
+      if (
+        !before &&
+        after?.type === "directory" &&
+        !isGitMetadataPath(relativePath) &&
+        !isDependencyMetadataPath(relativePath)
+      ) {
         continue;
       }
       if (before?.type === "directory" && !after) continue;
@@ -815,6 +1019,23 @@ export class RunVaultWorkspaceManager {
           kind: "deleted",
           protected: true,
           dependencyFile: false,
+          executable: false,
+          binary: true,
+          symbolicLink: false,
+        });
+      }
+    }
+    for (const dependencyMetadataPath of baseline.dependencyMetadataPaths) {
+      const parentPath = path.posix.dirname(dependencyMetadataPath);
+      if (parentPath === ".") continue;
+      const stagedParent = stagingByPath.get(parentPath);
+      if (stagedParent?.type === "directory") continue;
+      if (!changes.some((change) => change.path === dependencyMetadataPath)) {
+        changes.push({
+          path: dependencyMetadataPath,
+          kind: "deleted",
+          protected: true,
+          dependencyFile: true,
           executable: false,
           binary: true,
           symbolicLink: false,
@@ -900,7 +1121,17 @@ export class RunVaultWorkspaceManager {
         "Agent-created Git metadata cannot be promoted",
       );
     }
+    if (
+      stagingSnapshot.entries.some((entry) =>
+        isDependencyMetadataPath(entry.path),
+      )
+    ) {
+      throw new UnsafeWorkspaceEntryError(
+        "Agent-created dependency metadata cannot be promoted",
+      );
+    }
     const gitMetadataPaths = current.gitMetadataPaths;
+    const dependencyMetadataPaths = current.dependencyMetadataPaths;
 
     const backupWorkspacePath = path.join(this.stagingRoot, `${id}.backup`);
     const markerPath = this.promotionMarkerPath(id);
@@ -912,12 +1143,14 @@ export class RunVaultWorkspaceManager {
       backupWorkspacePath,
       markerPath,
       gitMetadataPaths,
-      markerVersion: 2,
+      dependencyMetadataPaths,
+      markerVersion: 3,
     };
     await this.writePromotionMarker(promotion, "prepared");
     try {
       await rename(trustedPath, backupWorkspacePath);
       await assertGitMetadataInventory(promotion);
+      await assertDependencyMetadataInventory(promotion);
       await rename(stagingWorkspacePath, trustedPath);
       await this.writePromotionMarker(promotion, "installed");
       await moveGitMetadataPaths(
@@ -925,7 +1158,13 @@ export class RunVaultWorkspaceManager {
         trustedPath,
         gitMetadataPaths,
       );
+      await moveDependencyMetadataPaths(
+        backupWorkspacePath,
+        trustedPath,
+        dependencyMetadataPaths,
+      );
       await assertGitMetadataInventory(promotion);
+      await assertDependencyMetadataInventory(promotion);
       await this.writePromotionMarker(promotion, "metadata_installed");
     } catch (error) {
       await this.restorePrePromotionState(promotion);
@@ -982,7 +1221,11 @@ export class RunVaultWorkspaceManager {
         ),
         markerPath,
         gitMetadataPaths:
-          parsed.version === 2 ? parsed.gitMetadataPaths : [],
+          parsed.version === 2 || parsed.version === 3
+            ? parsed.gitMetadataPaths
+            : [],
+        dependencyMetadataPaths:
+          parsed.version === 3 ? parsed.dependencyMetadataPaths : [],
         markerVersion: parsed.version,
       };
       const run = database.runs.find(
@@ -1055,7 +1298,22 @@ export class RunVaultWorkspaceManager {
     ) {
       throw new Error("Promotion contains invalid Git metadata paths");
     }
-    if (promotion.markerVersion !== 1 && promotion.markerVersion !== 2) {
+    if (
+      promotion.dependencyMetadataPaths.length >
+        MAX_DEPENDENCY_METADATA_PATHS ||
+      promotion.dependencyMetadataPaths.some(
+        (relativePath) => !isValidDependencyMetadataPath(relativePath),
+      ) ||
+      new Set(promotion.dependencyMetadataPaths).size !==
+        promotion.dependencyMetadataPaths.length
+    ) {
+      throw new Error("Promotion contains invalid dependency metadata paths");
+    }
+    if (
+      promotion.markerVersion !== 1 &&
+      promotion.markerVersion !== 2 &&
+      promotion.markerVersion !== 3
+    ) {
       throw new Error("Promotion contains an invalid marker version");
     }
   }
@@ -1065,12 +1323,13 @@ export class RunVaultWorkspaceManager {
     phase: PromotionPhase,
   ): Promise<void> {
     await this.validatePromotion(promotion);
-    const marker: PromotionMarkerV2 = {
-      version: 2,
+    const marker: PromotionMarkerV3 = {
+      version: 3,
       runId: promotion.id,
       agentId: promotion.agentId,
       phase,
       gitMetadataPaths: promotion.gitMetadataPaths,
+      dependencyMetadataPaths: promotion.dependencyMetadataPaths,
     };
     const temporaryPath = promotion.markerPath + ".tmp";
     await writeFile(temporaryPath, JSON.stringify(marker) + "\n", {
@@ -1112,6 +1371,20 @@ export class RunVaultWorkspaceManager {
           promotion.gitMetadataPaths,
         );
       }
+      if (promotion.markerVersion === 3) {
+        await assertGitMetadataInventory(promotion);
+        await assertDependencyMetadataInventory(promotion);
+        await moveGitMetadataPaths(
+          promotion.trustedWorkspacePath,
+          promotion.backupWorkspacePath,
+          promotion.gitMetadataPaths,
+        );
+        await moveDependencyMetadataPaths(
+          promotion.trustedWorkspacePath,
+          promotion.backupWorkspacePath,
+          promotion.dependencyMetadataPaths,
+        );
+      }
       await rename(promotion.trustedWorkspacePath, promotion.stagingWorkspacePath);
     }
     await rename(promotion.backupWorkspacePath, promotion.trustedWorkspacePath);
@@ -1145,6 +1418,22 @@ export class RunVaultWorkspaceManager {
         promotion.gitMetadataPaths,
       );
       await assertGitMetadataInventory(promotion);
+    }
+    if (promotion.markerVersion === 3) {
+      await assertGitMetadataInventory(promotion);
+      await assertDependencyMetadataInventory(promotion);
+      await moveGitMetadataPaths(
+        promotion.backupWorkspacePath,
+        promotion.trustedWorkspacePath,
+        promotion.gitMetadataPaths,
+      );
+      await moveDependencyMetadataPaths(
+        promotion.backupWorkspacePath,
+        promotion.trustedWorkspacePath,
+        promotion.dependencyMetadataPaths,
+      );
+      await assertGitMetadataInventory(promotion);
+      await assertDependencyMetadataInventory(promotion);
     }
 
     await rm(promotion.backupWorkspacePath, { recursive: true, force: true });

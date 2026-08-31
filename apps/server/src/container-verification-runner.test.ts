@@ -19,9 +19,12 @@ describe("container verification runner", () => {
       ARK_API_KEY: "must-not-enter-verifier",
       APP_AUTH_TOKEN: "app-auth-must-not-enter-verifier",
       CODEX_HOME: path.resolve("secret-codex-home"),
+      DEPENDENCY_CACHE_ROOT: "/app/dependencies",
+      DEPENDENCY_CACHE_HOST_ROOT: "/srv/launchpad/dependencies",
     });
     const staging = path.join(config.workspaceRoot, ".staging", "run-123");
-    const args = buildVerificationContainerArgs(staging, config);
+    const dependencyPath = `/srv/launchpad/dependencies/${"a".repeat(64)}/node_modules`;
+    const args = buildVerificationContainerArgs(staging, config, dependencyPath);
     const rendered = args.join(" ");
 
     expect(args.slice(0, 5)).toEqual(["run", "--rm", "--pull", "never", "--init"]);
@@ -45,7 +48,10 @@ describe("container verification runner", () => {
     expect(rendered).toContain("DOCKER_HOST=");
     expect(rendered).toContain("SSH_AUTH_SOCK=");
     expect(rendered).not.toContain("docker.sock");
-    expect(args.filter((argument) => argument === "--mount")).toHaveLength(1);
+    expect(rendered).toContain(
+      `type=bind,src=${dependencyPath},dst=/workspace/node_modules,readonly`,
+    );
+    expect(args.filter((argument) => argument === "--mount")).toHaveLength(2);
     expect(args.slice(-3)).toEqual(["runtime:test", "npm", "test"]);
   });
 

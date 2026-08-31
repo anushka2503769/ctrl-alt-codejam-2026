@@ -26,6 +26,9 @@ const reviewDiffQuery = z.object({ path: z.string().min(1).max(500) });
 const revisionBody = z.object({
   instructions: z.string().trim().min(1).max(50_000),
 });
+const dependencyPreparationBody = z.object({
+  confirmNetworkAccess: z.literal(true),
+});
 
 export async function createApp(
   config: AppConfig,
@@ -108,6 +111,17 @@ export async function createApp(
   app.post("/api/agents/:id/stop", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { agent: await service.stopAgent(id) };
+  });
+
+  app.post("/api/agents/:id/dependencies/prepare", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    const body = dependencyPreparationBody.parse(request.body);
+    return {
+      dependencyCache: await service.prepareDependencies(
+        id,
+        body.confirmNetworkAccess,
+      ),
+    };
   });
 
   app.get("/api/agents/:id/messages", async (request) => {

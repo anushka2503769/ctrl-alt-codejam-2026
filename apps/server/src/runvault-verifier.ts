@@ -28,6 +28,7 @@ export interface RunVaultVerificationRunnerOptions {
   timeoutMs: number;
   maxOutputBytes: number;
   sourceEnvironment: NodeJS.ProcessEnv;
+  dependencyCachePath: string | null;
 }
 
 export interface RunVaultVerificationRunner {
@@ -179,6 +180,7 @@ export class RunVaultVerifier {
   async verify(
     workspacePath: string,
     signal?: AbortSignal,
+    dependencyCachePath: string | null = null,
   ): Promise<RunVaultVerificationResult> {
     if (signal?.aborted) throw new RunCancelledError();
     const manifestPath = path.join(workspacePath, "package.json");
@@ -233,6 +235,7 @@ export class RunVaultVerifier {
             timeoutMs: this.timeoutMs,
             maxOutputBytes: this.maxOutputBytes,
             sourceEnvironment: this.sourceEnvironment,
+            dependencyCachePath,
           },
           signal,
         )

@@ -117,4 +117,31 @@ describe("HTTP boundary", () => {
     expect(requestRevision).toHaveBeenCalledWith(runId, "remove the risky change");
     await app.close();
   });
+
+  it("requires explicit network confirmation for dependency preparation", async () => {
+    const agentId = "123e4567-e89b-42d3-a456-426614174000";
+    const prepareDependencies = vi.fn(async () => ({
+      status: "prepared" as const,
+      cacheKey: "a".repeat(64),
+    }));
+    const dependencyService = { prepareDependencies } as unknown as AgentService;
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), dependencyService);
+
+    const denied = await app.inject({
+      method: "POST",
+      url: `/api/agents/${agentId}/dependencies/prepare`,
+      payload: { confirmNetworkAccess: false },
+    });
+    const prepared = await app.inject({
+      method: "POST",
+      url: `/api/agents/${agentId}/dependencies/prepare`,
+      payload: { confirmNetworkAccess: true },
+    });
+
+    expect(denied.statusCode).toBe(400);
+    expect(prepared.statusCode).toBe(200);
+    expect(prepareDependencies).toHaveBeenCalledOnce();
+    expect(prepareDependencies).toHaveBeenCalledWith(agentId, true);
+    await app.close();
+  });
 });

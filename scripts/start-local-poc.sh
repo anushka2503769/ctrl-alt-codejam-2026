@@ -104,9 +104,13 @@ else
   export AGENT_WORKSPACE_ROOT="${AGENT_WORKSPACE_ROOT:-$local_state_root/workspaces}"
   export CODEX_HOME="${CODEX_HOME:-$local_state_root/codex-home}"
 fi
+export DEPENDENCY_CACHE_ROOT="${DEPENDENCY_CACHE_ROOT:-$APP_DATA_DIR/dependencies}"
+export DEPENDENCY_CACHE_HOST_ROOT="${DEPENDENCY_CACHE_HOST_ROOT:-$DEPENDENCY_CACHE_ROOT}"
+export CONTAINER_WORKSPACE_HOST_ROOT="${CONTAINER_WORKSPACE_HOST_ROOT:-$AGENT_WORKSPACE_ROOT}"
+export CONTAINER_CODEX_HOME_HOST_ROOT="${CONTAINER_CODEX_HOME_HOST_ROOT:-$CODEX_HOME}"
 export RUNTIME_INSTANCE_ID="${RUNTIME_INSTANCE_ID:-local-$(id -u)-$(printf '%s' "$repo_dir" | cksum | awk '{print $1}')}"
 
-mkdir -p "$APP_DATA_DIR" "$AGENT_WORKSPACE_ROOT" "$CODEX_HOME"
+mkdir -p "$APP_DATA_DIR" "$AGENT_WORKSPACE_ROOT" "$CODEX_HOME" "$DEPENDENCY_CACHE_ROOT"
 log "Persistent state: $local_state_root"
 export CONTAINER_USER="${CONTAINER_USER:-$(id -u):$(id -g)}"
 
@@ -129,8 +133,9 @@ if ! "$engine" run --rm \
   "${preflight_user_args[@]}" \
   --mount "type=bind,src=$AGENT_WORKSPACE_ROOT,dst=/workspace" \
   --mount "type=bind,src=$CODEX_HOME,dst=/codex-home" \
+  --mount "type=bind,src=$DEPENDENCY_CACHE_ROOT,dst=/dependencies" \
   "$runtime_image" sh -lc \
-    'touch /workspace/.launchpad-write-test /codex-home/.launchpad-write-test && rm /workspace/.launchpad-write-test /codex-home/.launchpad-write-test'; then
+    'touch /workspace/.launchpad-write-test /codex-home/.launchpad-write-test /dependencies/.launchpad-write-test && rm /workspace/.launchpad-write-test /codex-home/.launchpad-write-test /dependencies/.launchpad-write-test'; then
   log "The container engine cannot mount $local_state_root."
   log "Set LOCAL_POC_DATA_ROOT to a directory shared with Docker/Colima/Podman."
   exit 2

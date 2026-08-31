@@ -116,14 +116,51 @@ describe("RunVaultWorkspaceManager", () => {
 
     await expect(readFile(path.join(staging.path, "src", "index.ts"), "utf8"))
       .resolves.toBe("export const one = 1;\n");
-    await expect(readFile(path.join(staging.path, "node_modules", "fixture.js"), "utf8"))
-      .resolves.toContain("module.exports");
+    await expect(lstat(path.join(staging.path, "node_modules"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
     await expect(lstat(path.join(staging.path, ".codex"))).rejects.toMatchObject({
       code: "ENOENT",
     });
     await expect(lstat(path.join(staging.path, ".git"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("does not traverse, hash, or copy trusted dependency metadata", async () => {
+    await writeFile(path.join(trusted, "source.ts"), "x");
+    await mkdir(path.join(trusted, "node_modules", "large-package"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(trusted, "node_modules", "large-package", "index.js"),
+      "x".repeat(4096),
+    );
+    await mkdir(path.join(trusted, "packages", "nested", "node_modules"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(trusted, "packages", "nested", "node_modules", "fixture.js"),
+      "nested",
+    );
+
+    const before = await manager.snapshotWorkspace(trusted);
+    const staging = await stage();
+    const after = await manager.snapshotWorkspace(trusted);
+
+    expect(before.fingerprint).toBe(after.fingerprint);
+    expect(before.entries.every((entry) => !entry.path.includes("node_modules")))
+      .toBe(true);
+    expect(before.dependencyMetadataPaths).toEqual([
+      "node_modules",
+      "packages/nested/node_modules",
+    ]);
+    await expect(lstat(path.join(staging.path, "node_modules"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      lstat(path.join(staging.path, "packages", "nested", "node_modules")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("does not traverse, hash, or copy trusted root and nested Git metadata", async () => {
@@ -302,6 +339,52 @@ describe("RunVaultWorkspaceManager", () => {
         staging.trustedSnapshot.fingerprint,
       ),
     ).rejects.toThrow("Agent-created Git metadata cannot be promoted");
+  });
+
+  it("detects even empty Agent-created dependency metadata and blocks promotion", async () => {
+    const staging = await stage();
+    await mkdir(path.join(staging.path, "node_modules"));
+
+    const inspection = await manager.inspectChanges(
+      staging.trustedSnapshot,
+      staging.path,
+    );
+
+    expect(inspection.changes).toEqual([
+      expect.objectContaining({
+        path: "node_modules",
+        kind: "added",
+        protected: true,
+        dependencyFile: true,
+      }),
+    ]);
+    await expect(
+      manager.beginPromotion(
+        staging.id,
+        trusted,
+        staging.trustedSnapshot.fingerprint,
+      ),
+    ).rejects.toThrow("Agent-created dependency metadata cannot be promoted");
+  });
+
+  it("excludes Agent-created dependency metadata from revision staging", async () => {
+    const parent = await stage("dependency-parent");
+    await mkdir(path.join(parent.path, "node_modules"));
+    const parentInspection = await manager.inspectChanges(
+      parent.trustedSnapshot,
+      parent.path,
+    );
+
+    const child = await manager.createRevisionStagingWorkspace(
+      "dependency-child",
+      parent.id,
+      trusted,
+      parentInspection.stagingFingerprint,
+      parent.trustedSnapshot.fingerprint,
+    );
+
+    await expect(lstat(path.join(child.path, "node_modules"))).rejects
+      .toMatchObject({ code: "ENOENT" });
   });
 
   it("retains Agent-created Git metadata in revision staging until removed", async () => {
@@ -495,6 +578,40 @@ describe("RunVaultWorkspaceManager", () => {
     await expect(readFile(path.join(trusted, ".git"), "utf8")).resolves.toBe(
       "gitdir: /srv/repository/.git/worktrees/agent-1\n",
     );
+    await expect(readFile(path.join(trusted, "state.txt"), "utf8")).resolves
+      .toBe("staged\n");
+  });
+
+  it("preserves root and nested trusted dependency metadata through promotion", async () => {
+    await mkdir(path.join(trusted, "node_modules"));
+    await writeFile(path.join(trusted, "node_modules", "root.js"), "root\n");
+    await mkdir(path.join(trusted, "packages", "app", "node_modules"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(trusted, "packages", "app", "node_modules", "nested.js"),
+      "nested\n",
+    );
+    await writeFile(path.join(trusted, "state.txt"), "trusted\n");
+    const staging = await stage("run-dependency-preservation");
+    await writeFile(path.join(staging.path, "state.txt"), "staged\n");
+
+    const promotion = await manager.beginPromotion(
+      staging.id,
+      trusted,
+      staging.trustedSnapshot.fingerprint,
+    );
+    await manager.finalizePromotion(promotion);
+
+    await expect(
+      readFile(path.join(trusted, "node_modules", "root.js"), "utf8"),
+    ).resolves.toBe("root\n");
+    await expect(
+      readFile(
+        path.join(trusted, "packages", "app", "node_modules", "nested.js"),
+        "utf8",
+      ),
+    ).resolves.toBe("nested\n");
     await expect(readFile(path.join(trusted, "state.txt"), "utf8")).resolves
       .toBe("staged\n");
   });

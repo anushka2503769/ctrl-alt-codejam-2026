@@ -68,10 +68,22 @@ installs staging on the same filesystem. A durable promotion marker and the
 persisted Run decision let startup reconciliation either finish the promotion
 or restore the backup after an interruption.
 
-RunVault copies `node_modules` when it is present. This makes verification use
-the same installed dependencies as the trusted workspace and avoids network
-installation during a Run. The trade-off is additional copy time and disk use;
-the POC favors repeatable verification over snapshot speed.
+RunVault treats `node_modules` as platform-managed metadata. It never traverses,
+content-hashes, copies into staging, or promotes those trees as Agent source.
+Existing trusted root and nested trees are inventoried by path and preserved
+across promotion or crash recovery for compatibility, but they are never
+mounted into Agent or verification containers. Agent-created `node_modules`,
+including an empty directory, is a protected dependency change and cannot be
+promoted.
+
+Optional managed npm caches are immutable and keyed by Runtime image ID, actual
+container platform, npm version, and `package.json`/`package-lock.json`
+digests. A matching cache's `node_modules` is mounted read-only into both the
+Agent and no-network verifier. A dependency-file change cannot use the prior
+cache. Runs fail before Agent execution when a required initial cache is
+missing; after a dependency change, verification is skipped and policy retains
+the staging workspace for review. Only the explicit authenticated preparation
+endpoint may run networked `npm ci`, and it disables lifecycle scripts.
 
 Trusted `.git` files and directories, including nested repository metadata, are
 inventoried by path but never copied into staging or content-hashed. A staging
@@ -79,7 +91,9 @@ snapshot records Agent-created `.git` as one bounded protected entry even when
 the directory is empty; it cannot be approved. Version-two promotion markers
 move trusted Git metadata from the backup into the installed workspace and let
 restart recovery complete or reverse a partially transferred set. Version-one
-markers remain readable for interrupted promotions created by older releases.
+and version-two markers remain readable for interrupted promotions created by
+older releases; version-three markers also inventory preserved dependency
+metadata.
 Staging also records path-free duration, copied-entry, and estimated-byte
 measurements for later operational reporting.
 
