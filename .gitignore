@@ -4,6 +4,7 @@ dist/
 .env.production
 .data/
 .local/
+.runvault-test-drive/
 data/
 workspaces/
 codex-home/

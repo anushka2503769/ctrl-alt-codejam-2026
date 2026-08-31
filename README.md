@@ -385,6 +385,7 @@ scenarios assert that the trusted workspace content or fingerprint is unchanged.
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Local POC](docs/LOCAL_POC.md)
+- [RunVault hands-on test drive](docs/RUNVAULT_TEST_DRIVE.md)
 - [Deployment](docs/DEPLOYMENT.md)
 - [Hackathon extension guide](docs/HACKATHON_EXTENSION_GUIDE.md)
 - [Security policy](SECURITY.md)
