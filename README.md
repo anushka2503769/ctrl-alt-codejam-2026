@@ -34,7 +34,9 @@ Volcengine ECS.
   resource-limited verification container
 - Focused Run review with findings, file classifications, and safe bounded diffs
 - Revision Runs that continue quarantined proposals without approving the parent
-- Redacted Run evidence with protected-path metadata
+- Cross-Agent Run history with outcome, finding, verification, lineage, and date filters
+- Redacted JSON evidence export with bounded lifecycle and operational metrics
+- Authenticated staging, dependency-cache, verifier, and cleanup diagnostics
 - Human approval or discard for quarantined work
 - Crash-safe promotion and restart reconciliation
 - Workspace and Codex conversation promoted as one decision
@@ -126,6 +128,30 @@ Update deploy/production.yml with a new production rollout configuration.
 
 RunVault shows the protected path and verification metadata, but never displays
 the protected file's contents in its decision evidence.
+
+Select **Run history** in the sidebar to search decisions across Agents. A
+history result can reopen its exact Agent Run or download a redacted JSON
+evidence file. Exports contain decision metadata, relative changed paths,
+bounded lifecycle events, and numeric metrics; they omit prompts, Agent output,
+Run errors, verification output, secrets, and absolute workspace paths.
+
+The history and diagnostics APIs use the same shared-token protection as the
+rest of the control plane:
+
+```bash
+curl --fail \
+  --header "Authorization: Bearer $APP_AUTH_TOKEN" \
+  "http://127.0.0.1:3000/api/runs?outcome=quarantined&verification=failed"
+
+curl --fail \
+  --header "Authorization: Bearer $APP_AUTH_TOKEN" \
+  "http://127.0.0.1:3000/api/runvault/diagnostics"
+```
+
+History accepts `agentId`, `outcome`, `finding`, `verification`, `lineage`,
+`lineageRunId`, `from`, `to`, and `limit` filters. Evidence is available from
+`GET /api/runs/:id/runvault/evidence`. These records are an operational aid for
+the single-user POC, not a tamper-proof audit log.
 
 ### Optional managed npm dependencies
 
@@ -322,6 +348,13 @@ unavailable, and skipped verification remain distinct evidence states.
 Quarantined staging is assigned `retainedAt` and `expiresAt`; expiry preserves
 redacted decision evidence, marks the Run expired, removes staging, and never
 commits its provisional Codex thread.
+
+Each Run also retains at most 100 typed lifecycle events and a fixed set of
+timing, size, outcome, verification, and cleanup metrics. Metric events contain
+only Run and Agent IDs, enums, numbers, and timestamps—never prompts, content,
+secrets, or filesystem paths. Authenticated diagnostics report retained staging
+usage, orphan cleanup, dependency-cache state, verifier availability, and
+aggregate persisted metrics.
 
 Deleting an Agent archives its workspace under `workspaces/.deleted/`.
 

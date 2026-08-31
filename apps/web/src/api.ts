@@ -2,8 +2,14 @@ import type {
   Agent,
   AgentRun,
   Message,
+  RunVaultDiagnostics,
+  RunVaultEvidenceExport,
+  RunVaultFindingCode,
+  RunVaultHistoryEntry,
+  RunVaultOutcome,
   RunVaultReviewEvidence,
   RunVaultTextDiff,
+  RunVaultVerificationStatus,
   SystemInfo,
 } from "./types";
 
@@ -42,6 +48,8 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 export const api = {
   auth: () => request<{ required: boolean }>("/api/auth"),
   system: () => request<SystemInfo>("/api/system"),
+  runVaultDiagnostics: () =>
+    request<{ diagnostics: RunVaultDiagnostics }>("/api/runvault/diagnostics"),
   listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
   createAgent: (body: {
     name: string;
@@ -76,6 +84,24 @@ export const api = {
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),
   runs: (id: string) =>
     request<{ runs: AgentRun[] }>("/api/agents/" + id + "/runs"),
+  runVaultHistory: (filters: {
+    agentId?: string;
+    outcome?: RunVaultOutcome;
+    finding?: RunVaultFindingCode;
+    verification?: RunVaultVerificationStatus;
+    lineage?: "root" | "revision";
+    lineageRunId?: string;
+    from?: string;
+    to?: string;
+    limit?: number;
+  }) => {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== "") query.set(key, String(value));
+    }
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    return request<{ runs: RunVaultHistoryEntry[] }>(`/api/runs${suffix}`);
+  },
   sendMessage: (id: string, content: string) =>
     request<{ run: AgentRun; message: Message }>(
       "/api/agents/" + id + "/messages",
@@ -88,6 +114,10 @@ export const api = {
   runVaultReview: (id: string) =>
     request<{ review: RunVaultReviewEvidence }>(
       "/api/runs/" + id + "/runvault/review",
+    ),
+  runVaultEvidence: (id: string) =>
+    request<{ evidence: RunVaultEvidenceExport }>(
+      "/api/runs/" + id + "/runvault/evidence",
     ),
   runVaultDiff: (id: string, path: string) =>
     request<{ diff: RunVaultTextDiff }>(

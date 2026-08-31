@@ -1,12 +1,14 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { lstat, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { RunCancelledError } from "./errors.js";
 import type { RunVaultVerification } from "./types.js";
 
 export const DEFAULT_VERIFICATION_TIMEOUT_MS = 120_000;
 export const DEFAULT_VERIFICATION_MAX_OUTPUT_BYTES = 16_384;
+const execFileAsync = promisify(execFile);
 
 const SENSITIVE_ENVIRONMENT_NAME =
   /(token|secret|password|passwd|credential|private|api[_-]?key|authorization|cookie)/i;
@@ -32,6 +34,7 @@ export interface RunVaultVerificationRunnerOptions {
 }
 
 export interface RunVaultVerificationRunner {
+  isAvailable?(): Promise<boolean>;
   run(
     workspacePath: string,
     options: RunVaultVerificationRunnerOptions,
@@ -174,6 +177,16 @@ export class RunVaultVerifier {
     }
     if (!Number.isInteger(this.maxOutputBytes) || this.maxOutputBytes <= 0) {
       throw new Error("Verification output limit must be a positive integer");
+    }
+  }
+
+  async isAvailable(): Promise<boolean> {
+    if (this.runner?.isAvailable) return this.runner.isAvailable();
+    try {
+      await execFileAsync(this.npmCommand, ["--version"], { timeout: 5_000 });
+      return true;
+    } catch {
+      return false;
     }
   }
 

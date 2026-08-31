@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
 import type { RunVaultAction } from "./RunVaultPanel";
+import { RunVaultHistory } from "./RunVaultHistory";
 import { RunVaultReview } from "./RunVaultReview";
 import {
   lastMessageIndexes,
@@ -9,7 +10,13 @@ import {
   runsWithoutMessages as findRunsWithoutMessages,
 } from "./run-history";
 import { workspaceOutcomeCopy } from "./runvault-copy";
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type {
+  Agent,
+  AgentRun,
+  Message,
+  RunVaultHistoryEntry,
+  SystemInfo,
+} from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -86,6 +93,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
@@ -104,6 +112,7 @@ export default function App() {
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
   const pollingRunIds = useRef(new Set<string>());
+  const pendingHistoryRun = useRef<{ agentId: string; runId: string } | null>(null);
   selectedIdRef.current = selectedId;
 
   const selected = useMemo(
@@ -148,7 +157,13 @@ export default function App() {
     const result = await api.runs(agentId);
     if (mountedRef.current && selectedIdRef.current === agentId) {
       setRuns(result.runs);
-      setSelectedRunId((current) => resolvedRunId(current, result.runs));
+      const pending = pendingHistoryRun.current;
+      setSelectedRunId((current) =>
+        pending?.agentId === agentId && result.runs.some((run) => run.id === pending.runId)
+          ? pending.runId
+          : resolvedRunId(current, result.runs),
+      );
+      if (pending?.agentId === agentId) pendingHistoryRun.current = null;
     }
     return result.runs;
   }, []);
@@ -399,6 +414,18 @@ export default function App() {
     }
   };
 
+  const openHistoryRun = (run: RunVaultHistoryEntry) => {
+    pendingHistoryRun.current = { agentId: run.agentId, runId: run.id };
+    setShowHistory(false);
+    if (selectedIdRef.current === run.agentId) {
+      void refreshRuns(run.agentId).catch((reason) =>
+        setError(reason instanceof Error ? reason.message : String(reason)),
+      );
+    } else {
+      setSelectedId(run.agentId);
+    }
+  };
+
   const unlock = async (event: React.FormEvent) => {
     event.preventDefault();
     setBusy(true);
@@ -480,9 +507,23 @@ export default function App() {
           onClick={() => {
             setForm(emptyForm);
             setShowCreate(true);
+            setShowHistory(false);
           }}
         >
           <span>＋</span> Create Agent
+        </button>
+
+        <button
+          type="button"
+          className={`sidebar-history${showHistory ? " selected" : ""}`}
+          aria-pressed={showHistory}
+          onClick={() => {
+            setShowHistory(true);
+            setShowSettings(false);
+          }}
+        >
+          <span>◫</span>
+          <strong>Run history</strong>
         </button>
 
         <div className="sidebar-label">
@@ -494,7 +535,10 @@ export default function App() {
             <button
               className={"agent-card " + (agent.id === selectedId ? "selected" : "")}
               key={agent.id}
-              onClick={() => setSelectedId(agent.id)}
+              onClick={() => {
+                setShowHistory(false);
+                setSelectedId(agent.id);
+              }}
             >
               <div className="agent-avatar">{agent.name.slice(0, 1).toUpperCase()}</div>
               <div className="agent-card-copy">
@@ -546,7 +590,9 @@ export default function App() {
           </div>
         )}
 
-        {selected ? (
+        {showHistory ? (
+          <RunVaultHistory agents={agents} onOpenRun={openHistoryRun} />
+        ) : selected ? (
           <>
             <header className="agent-header">
               <div>
@@ -835,6 +881,7 @@ export default function App() {
               onClick={() => {
                 setForm(emptyForm);
                 setShowCreate(true);
+                setShowHistory(false);
               }}
             >
               Create your first Agent

@@ -201,6 +201,62 @@ describe("Agent lifecycle", () => {
       outcome: "promoted",
       reason: "verified_safe",
     });
+    expect(service.getRun(run.id).runVaultEvents.map((event) => event.type)).toEqual([
+      "staged",
+      "inspected",
+      "verified",
+      "decided",
+      "promoted",
+    ]);
+    expect(service.getRun(run.id).runVaultMetrics).toMatchObject({
+      cleanupStatus: "completed",
+      outcome: "promoted",
+      verificationStatus: "skipped",
+      changedFileCount: 0,
+      changedBytes: 0,
+    });
+    expect(service.getRun(run.id).runVaultMetrics.stagingDurationMs).toEqual(
+      expect.any(Number),
+    );
+  });
+
+  it("aggregates path-free operational diagnostics", async () => {
+    const verifier = new RunVaultVerifier({
+      runner: {
+        isAvailable: async () => true,
+        run: async () => ({
+          status: "passed",
+          command: "npm test",
+          redactedSummary: "passed",
+          exitCode: 0,
+          timedOut: false,
+        }),
+      },
+    });
+    const harness = await makeServiceHarness(
+      new FakeRunner(),
+      (workspaceRoot) => new RunVaultWorkspaceManager(workspaceRoot),
+      verifier,
+    );
+    const agent = await harness.service.createAgent({ name: "Observed builder" });
+    const { run } = await harness.service.sendMessage(agent.id, "observe this run");
+    await expect.poll(() => harness.service.getRun(run.id).status).toBe("completed");
+
+    const diagnostics = await harness.service.runVaultDiagnostics();
+    expect(diagnostics).toMatchObject({
+      verifierAvailable: true,
+      storageModel: "single-process-json",
+      tamperProof: false,
+      staging: { retainedRunCount: 0, orphanCount: 0 },
+      dependencies: { mode: "disabled", activePreparations: 0 },
+      metrics: {
+        totalRuns: 1,
+        decidedRuns: 1,
+        outcomes: { promoted: 1, quarantined: 0, discarded: 0 },
+        cleanupFailures: 0,
+      },
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain(agent.workspacePath);
   });
 
   it("passes the same managed dependency cache to Agent and verification", async () => {
@@ -730,6 +786,16 @@ describe("Agent lifecycle", () => {
       changedFiles: { protectedPathsTouched: [".env"] },
     });
     expect(JSON.stringify(completed.runVault)).not.toContain("never-expose-this-value");
+    const evidence = service.getRunVaultEvidence(run.id);
+    const serializedEvidence = JSON.stringify(evidence);
+    expect(serializedEvidence).not.toContain(secret.trim());
+    expect(serializedEvidence).not.toContain("prepare local secrets");
+    expect(serializedEvidence).not.toContain("Prepared local config");
+    expect(serializedEvidence).not.toContain(agent.workspacePath);
+    expect(evidence.decision.verification).toEqual({
+      status: "skipped",
+      command: null,
+    });
     expect(await trustedFingerprint(agent.workspacePath)).toBe(before);
     await expect(lstat(path.join(agent.workspacePath, ".env"))).rejects
       .toMatchObject({ code: "ENOENT" });
@@ -1016,6 +1082,22 @@ describe("Agent lifecycle", () => {
       supersededByRunId: child.id,
       runVault: { outcome: "quarantined", reason: "protected_path" },
     });
+    expect(service.getRun(parent.id).runVaultEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "revision_requested",
+          relatedRunId: child.id,
+        }),
+      ]),
+    );
+    expect(service.getRun(child.id).runVaultEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "revision_requested",
+          relatedRunId: parent.id,
+        }),
+      ]),
+    );
     expect(service.getAgent(agent.id).codexThreadId).toBe("child-thread");
     await expect(
       readFile(path.join(agent.workspacePath, "src", "safe.ts"), "utf8"),
@@ -1690,6 +1772,13 @@ describe("Agent lifecycle", () => {
         expect.objectContaining({ code: "retention_expired" }),
       ]),
     });
+    expect(expired.runVaultEvents.map((event) => event.type)).toEqual(
+      expect.arrayContaining(["expired", "discarded"]),
+    );
+    expect(expired.runVaultMetrics).toMatchObject({
+      outcome: "discarded",
+      cleanupStatus: "completed",
+    });
     expect(JSON.stringify(expired.runVault)).not.toContain("SECRET=value");
     expect(harness.service.getAgent(agent.id).codexThreadId).toBeNull();
     await expect(lstat(harness.runVaultWorkspaces.stagingPath(run.id))).rejects
@@ -1739,6 +1828,8 @@ describe("Agent lifecycle", () => {
     await expect(approval).resolves.toMatchObject({
       runVault: { outcome: "promoted", resolution: "human_approved" },
     });
+    expect(harness.service.getRun(run.id).runVaultEvents.map((event) => event.type))
+      .toEqual(expect.arrayContaining(["approved", "promoted"]));
     await expect(harness.service.sweepExpiredQuarantines(expiresAt + 2))
       .resolves.toBe(0);
     expect(harness.service.getAgent(agent.id).codexThreadId).toBe("approved-thread");

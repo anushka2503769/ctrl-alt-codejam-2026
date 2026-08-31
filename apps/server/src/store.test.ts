@@ -51,6 +51,14 @@ describe("JsonStore", () => {
       parentRunId: null,
       supersededByRunId: null,
       revisionNumber: 0,
+      runVaultEvents: [],
+      runVaultMetrics: {
+        cleanupStatus: "not_required",
+        outcome: null,
+        verificationStatus: null,
+        changedFileCount: 0,
+        changedBytes: 0,
+      },
     });
   });
 

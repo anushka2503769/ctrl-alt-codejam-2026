@@ -29,6 +29,43 @@ const revisionBody = z.object({
 const dependencyPreparationBody = z.object({
   confirmNetworkAccess: z.literal(true),
 });
+const runHistoryQuery = z
+  .object({
+    agentId: z.string().uuid().optional(),
+    outcome: z.enum(["promoted", "quarantined", "discarded"]).optional(),
+    finding: z
+      .enum([
+        "execution_cancelled",
+        "execution_timed_out",
+        "execution_failed",
+        "verification_failed",
+        "trusted_workspace_changed",
+        "unsafe_link",
+        "protected_path",
+        "dependency_change",
+        "unsafe_file",
+        "change_limit_exceeded",
+        "deletion_limit_exceeded",
+        "verification_required",
+        "change_bytes_exceeded",
+        "verification_unavailable",
+        "staging_quota_exceeded",
+        "retention_expired",
+      ])
+      .optional(),
+    verification: z
+      .enum(["passed", "failed", "skipped", "unavailable"])
+      .optional(),
+    lineage: z.enum(["root", "revision"]).optional(),
+    lineageRunId: z.string().uuid().optional(),
+    from: z.string().datetime({ offset: true }).optional(),
+    to: z.string().datetime({ offset: true }).optional(),
+    limit: z.coerce.number().int().min(1).max(200).optional(),
+  })
+  .refine(
+    (query) => !query.from || !query.to || Date.parse(query.from) <= Date.parse(query.to),
+    "History start date must be before the end date",
+  );
 
 export async function createApp(
   config: AppConfig,
@@ -81,6 +118,10 @@ export async function createApp(
   app.get("/api/auth", async () => ({ required: config.authToken.length > 0 }));
 
   app.get("/api/system", async () => service.systemInfo());
+
+  app.get("/api/runvault/diagnostics", async () => ({
+    diagnostics: await service.runVaultDiagnostics(),
+  }));
 
   app.get("/api/agents", async () => ({ agents: service.listAgents() }));
 
@@ -144,9 +185,23 @@ export async function createApp(
     return reply.code(202).send(result);
   });
 
+  app.get("/api/runs", async (request) => {
+    const filters = runHistoryQuery.parse(request.query);
+    return { runs: service.getRunVaultHistory(filters) };
+  });
+
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
     return { run: service.getRun(id) };
+  });
+
+  app.get("/api/runs/:id/runvault/evidence", async (request, reply) => {
+    const { id } = runIdParams.parse(request.params);
+    reply.header(
+      "Content-Disposition",
+      `attachment; filename="runvault-evidence-${id}.json"`,
+    );
+    return { evidence: service.getRunVaultEvidence(id) };
   });
 
   app.get("/api/runs/:id/runvault/review", async (request) => {

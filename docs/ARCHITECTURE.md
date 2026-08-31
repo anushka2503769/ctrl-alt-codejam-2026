@@ -139,6 +139,33 @@ codex-home/               Codex configuration and sessions
 `JsonStore` serializes writes and atomically replaces one JSON file. It supports
 one process only.
 
+### History and operational diagnostics
+
+Every Run stores a bounded sequence of typed lifecycle events: staged,
+inspected, verified, decided, revision requested, approved, promoted,
+discarded, expired, and reconciled. The oldest event is dropped after the
+per-Run limit of 100. Events accept only predefined enum values, timestamps,
+and related Run IDs; they do not accept arbitrary messages or file content.
+
+Persisted Run metrics use a fixed path-free schema for staging, Agent,
+inspection, verification, decision, and cleanup duration; staged entries and
+bytes; changed files and bytes; outcome; verification status; and cleanup
+status. A Node diagnostics channel publishes the same bounded metadata shape
+for optional process-local consumers.
+
+The authenticated global history endpoint derives redacted summaries from the
+JSON store and supports Agent, outcome, finding, verification, root/revision,
+lineage-family, date, and bounded-limit filters. Evidence export deliberately
+omits prompt, Agent output, Run error, verification output, and absolute paths.
+It preserves relative changed paths and policy metadata so a decision remains
+explainable.
+
+Authenticated diagnostics combine persisted Run metrics with current retained
+staging size, missing staging, orphan/transaction cleanup state, dependency
+cache validity and size, and verifier Runtime availability. `/api/health`
+remains a minimal public liveness response. Diagnostics are operational
+observability, not an authorization or integrity boundary.
+
 ### Runtime providers
 
 - `CodexRunner` runs Codex inside the application container for ECS.
@@ -168,3 +195,7 @@ the Agent's committed thread only when RunVault promotes that workspace.
 
 The current container or ECS instance is the POC trust boundary. Ordinary
 containers are not hardened multi-tenant isolation.
+
+The history store is explicitly single-process JSON. It has no append-only
+integrity chain, external witness, signature, or user attribution and therefore
+must not be described as tamper-proof or as a multi-user audit log.

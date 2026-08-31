@@ -127,6 +127,36 @@ export interface StagingUsage {
   totalBytes: number;
 }
 
+export interface RunVaultReconciliationRecord {
+  runId: string;
+  action:
+    | "completed_promotion"
+    | "restored_quarantine"
+    | "discarded_staging";
+}
+
+export interface RunVaultReconciliationSummary {
+  at: string;
+  records: RunVaultReconciliationRecord[];
+  removedOrphans: number;
+  removedOrphanBytes: number;
+}
+
+export interface RunVaultWorkspaceDiagnostics {
+  retainedRunCount: number;
+  missingRetainedRunCount: number;
+  retainedBytes: number;
+  totalManagedBytes: number;
+  orphanCount: number;
+  orphanBytes: number;
+  promotionMarkerCount: number;
+  backupCount: number;
+  lastReconciliationAt: string | null;
+  lastReconciledTransactions: number;
+  lastRemovedOrphans: number;
+  lastRemovedOrphanBytes: number;
+}
+
 export interface RunVaultPromotion {
   id: string;
   agentId: string;
@@ -847,6 +877,7 @@ function entriesEqual(
 export class RunVaultWorkspaceManager {
   private readonly stagingRoot: string;
   private stagingCreationQueue: Promise<void> = Promise.resolve();
+  private lastReconciliation: RunVaultReconciliationSummary | null = null;
 
   constructor(private readonly workspaceRoot: string) {
     this.workspaceRoot = path.resolve(workspaceRoot);
@@ -1294,8 +1325,11 @@ export class RunVaultWorkspaceManager {
     await rm(promotion.markerPath, { force: true });
   }
 
-  async reconcileTransactions(database: Database): Promise<void> {
+  async reconcileTransactions(
+    database: Database,
+  ): Promise<RunVaultReconciliationSummary> {
     await this.initialize();
+    const records: RunVaultReconciliationRecord[] = [];
     const entries = await readdir(this.stagingRoot, { withFileTypes: true });
     const markerNames = entries
       .filter(
@@ -1350,10 +1384,14 @@ export class RunVaultWorkspaceManager {
 
       if (run.runVault?.outcome === "promoted") {
         await this.finishCommittedPromotion(promotion);
+        records.push({ runId: parsed.runId, action: "completed_promotion" });
       } else {
         await this.restorePrePromotionState(promotion);
         if (run.runVault?.outcome !== "quarantined") {
           await this.discardStagingWorkspace(parsed.runId);
+          records.push({ runId: parsed.runId, action: "discarded_staging" });
+        } else {
+          records.push({ runId: parsed.runId, action: "restored_quarantine" });
         }
         await rm(markerPath, { force: true });
       }
@@ -1368,6 +1406,8 @@ export class RunVaultWorkspaceManager {
       ),
     );
     const remaining = await readdir(this.stagingRoot, { withFileTypes: true });
+    let removedOrphans = 0;
+    let removedOrphanBytes = 0;
     for (const entry of remaining) {
       if (entry.name.endsWith(".promotion.json.tmp")) {
         await rm(path.join(this.stagingRoot, entry.name), { force: true });
@@ -1375,12 +1415,79 @@ export class RunVaultWorkspaceManager {
       }
       if (!entry.isDirectory() || entry.name.endsWith(".backup")) continue;
       if (!retainedStagingIds.has(entry.name)) {
+        removedOrphanBytes += await measureTreeBytes(
+          path.join(this.stagingRoot, entry.name),
+        );
+        removedOrphans += 1;
         await rm(path.join(this.stagingRoot, entry.name), {
           recursive: true,
           force: true,
         });
       }
     }
+    const summary: RunVaultReconciliationSummary = {
+      at: new Date().toISOString(),
+      records,
+      removedOrphans,
+      removedOrphanBytes,
+    };
+    this.lastReconciliation = summary;
+    return summary;
+  }
+
+  async diagnostics(database: Database): Promise<RunVaultWorkspaceDiagnostics> {
+    await this.initialize();
+    const retainedIds = new Set(
+      database.runs.flatMap((run) =>
+        run.runVault?.outcome === "quarantined" &&
+        run.runVault.stagingWorkspaceId
+          ? [run.runVault.stagingWorkspaceId]
+          : [],
+      ),
+    );
+    const entries = await readdir(this.stagingRoot, { withFileTypes: true });
+    let retainedRunCount = 0;
+    let retainedBytes = 0;
+    let orphanCount = 0;
+    let orphanBytes = 0;
+    let promotionMarkerCount = 0;
+    let backupCount = 0;
+    for (const entry of entries) {
+      const candidate = path.join(this.stagingRoot, entry.name);
+      if (entry.isFile() && entry.name.endsWith(".promotion.json")) {
+        promotionMarkerCount += 1;
+        continue;
+      }
+      if (!entry.isDirectory()) continue;
+      if (entry.name.endsWith(".backup")) {
+        backupCount += 1;
+        continue;
+      }
+      const bytes = await measureTreeBytes(candidate);
+      if (retainedIds.has(entry.name)) {
+        retainedRunCount += 1;
+        retainedBytes += bytes;
+      } else {
+        orphanCount += 1;
+        orphanBytes += bytes;
+      }
+    }
+    return {
+      retainedRunCount,
+      missingRetainedRunCount: Math.max(0, retainedIds.size - retainedRunCount),
+      retainedBytes,
+      totalManagedBytes: await measureTreeBytes(this.stagingRoot),
+      orphanCount,
+      orphanBytes,
+      promotionMarkerCount,
+      backupCount,
+      lastReconciliationAt: this.lastReconciliation?.at ?? null,
+      lastReconciledTransactions:
+        this.lastReconciliation?.records.length ?? 0,
+      lastRemovedOrphans: this.lastReconciliation?.removedOrphans ?? 0,
+      lastRemovedOrphanBytes:
+        this.lastReconciliation?.removedOrphanBytes ?? 0,
+    };
   }
 
   async stagingUsage(stagingWorkspacePath: string): Promise<StagingUsage> {

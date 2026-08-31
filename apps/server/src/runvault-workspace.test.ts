@@ -848,13 +848,30 @@ describe("RunVaultWorkspaceManager", () => {
   it("removes orphan staging while preserving persisted quarantine", async () => {
     const retained = await stage("run-retained");
     const orphan = await stage("run-orphan");
+    await writeFile(path.join(orphan.path, "orphan.txt"), "orphan data\n");
 
-    await manager.reconcileTransactions(
+    const reconciliation = await manager.reconcileTransactions(
       databaseForRun(retained.id, "quarantined"),
     );
 
+    expect(reconciliation).toMatchObject({
+      records: [],
+      removedOrphans: 1,
+      removedOrphanBytes: expect.any(Number),
+    });
+    expect(reconciliation.removedOrphanBytes).toBeGreaterThan(0);
     await expect(lstat(retained.path)).resolves.toBeDefined();
     await expect(lstat(orphan.path)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      manager.diagnostics(databaseForRun(retained.id, "quarantined")),
+    ).resolves.toMatchObject({
+      retainedRunCount: 1,
+      missingRetainedRunCount: 0,
+      orphanCount: 0,
+      lastReconciledTransactions: 0,
+      lastRemovedOrphans: 1,
+      lastRemovedOrphanBytes: reconciliation.removedOrphanBytes,
+    });
   });
 
   it("refuses promotion after the trusted workspace changes", async () => {

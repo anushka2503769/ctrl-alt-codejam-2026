@@ -120,6 +120,14 @@ describe("DependencyManager", () => {
       (await lstat(path.join(resolution.mountPath!, "fixture", "index.js"))).mode &
         0o222,
     ).toBe(0);
+    await expect(fixture.manager.diagnostics()).resolves.toMatchObject({
+      mode: "isolated-ci",
+      validCacheCount: 1,
+      invalidCacheCount: 0,
+      partialCacheCount: 0,
+      activePreparations: 0,
+      totalBytes: expect.any(Number),
+    });
   });
 
   it("invalidates the cache key when the lockfile changes", async () => {

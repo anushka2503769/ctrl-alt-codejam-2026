@@ -55,6 +55,15 @@ export interface DependencyPreparationResult {
   cacheKey: string;
 }
 
+export interface DependencyCacheDiagnostics {
+  mode: "disabled" | "existing-cache" | "isolated-ci";
+  validCacheCount: number;
+  invalidCacheCount: number;
+  partialCacheCount: number;
+  totalBytes: number;
+  activePreparations: number;
+}
+
 interface DependencyDescriptor {
   cacheKey: string;
   packageJsonPath: string;
@@ -186,6 +195,25 @@ async function removeWritableTree(root: string): Promise<void> {
   await rm(root, { recursive: true, force: true });
 }
 
+async function measureManagedTreeBytes(root: string): Promise<number> {
+  let stats;
+  try {
+    stats = await lstat(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  if (stats.isFile()) return stats.size;
+  if (stats.isSymbolicLink()) return Buffer.byteLength(await readlink(root));
+  if (!stats.isDirectory()) return 0;
+  const entries = await readdir(root, { withFileTypes: true });
+  let total = 0;
+  for (const entry of entries) {
+    total += await measureManagedTreeBytes(path.join(root, entry.name));
+  }
+  return total;
+}
+
 export class DependencyManager {
   private readonly preparations = new Map<
     string,
@@ -294,6 +322,56 @@ export class DependencyManager {
     });
     this.preparations.set(descriptor.cacheKey, preparation);
     return preparation;
+  }
+
+  async diagnostics(): Promise<DependencyCacheDiagnostics> {
+    await mkdir(this.config.dependencyCacheRoot, { recursive: true, mode: 0o700 });
+    const entries = await readdir(this.config.dependencyCacheRoot, {
+      withFileTypes: true,
+    });
+    let validCacheCount = 0;
+    let invalidCacheCount = 0;
+    let partialCacheCount = 0;
+    for (const entry of entries) {
+      if (/^[a-f0-9]{64}\.partial-[A-Za-z0-9-]+$/.test(entry.name)) {
+        partialCacheCount += 1;
+        continue;
+      }
+      if (!entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name)) {
+        invalidCacheCount += 1;
+        continue;
+      }
+      try {
+        const modules = await lstat(
+          path.join(this.config.dependencyCacheRoot, entry.name, "node_modules"),
+        );
+        const metadata = JSON.parse(
+          await readFile(
+            path.join(this.config.dependencyCacheRoot, entry.name, CACHE_METADATA_FILE),
+            "utf8",
+          ),
+        ) as { version?: unknown; cacheKey?: unknown };
+        if (
+          modules.isDirectory() &&
+          metadata.version === 1 &&
+          metadata.cacheKey === entry.name
+        ) {
+          validCacheCount += 1;
+        } else {
+          invalidCacheCount += 1;
+        }
+      } catch {
+        invalidCacheCount += 1;
+      }
+    }
+    return {
+      mode: this.config.dependencyMode,
+      validCacheCount,
+      invalidCacheCount,
+      partialCacheCount,
+      totalBytes: await measureManagedTreeBytes(this.config.dependencyCacheRoot),
+      activePreparations: this.preparations.size,
+    };
   }
 
   private async describe(

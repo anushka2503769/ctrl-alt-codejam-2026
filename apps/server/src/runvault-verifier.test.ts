@@ -185,6 +185,22 @@ describe("RunVaultVerifier", () => {
     expect(result.redactedSummary).toContain("npm test could not start");
   });
 
+  it("reports delegated verifier availability without executing a test", async () => {
+    let runCalled = false;
+    const verifier = new RunVaultVerifier({
+      runner: {
+        isAvailable: async () => false,
+        run: async () => {
+          runCalled = true;
+          throw new Error("must not execute");
+        },
+      },
+    });
+
+    await expect(verifier.isAvailable()).resolves.toBe(false);
+    expect(runCalled).toBe(false);
+  });
+
   it("validates verifier resource limits", () => {
     expect(() => new RunVaultVerifier({ timeoutMs: 0 })).toThrow(
       "Verification timeout must be a positive integer",

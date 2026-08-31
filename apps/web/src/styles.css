@@ -199,6 +199,37 @@ button {
   font-weight: 400;
 }
 
+.sidebar-history {
+  width: 100%;
+  min-height: 42px;
+  margin-top: 8px;
+  padding: 0 13px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #aaa7b4;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.sidebar-history:hover,
+.sidebar-history.selected {
+  color: #f5f3ed;
+  background: #353430;
+  border-color: #464540;
+}
+
+.sidebar-history span {
+  font-size: 18px;
+}
+
+.sidebar-history strong {
+  font-size: 12px;
+}
+
 .sidebar-label {
   display: flex;
   justify-content: space-between;
@@ -355,6 +386,176 @@ button {
   background:
     radial-gradient(circle at 86% -10%, rgba(105, 84, 217, 0.09), transparent 30%),
     #f2f1ed;
+}
+
+.history-page {
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+.history-header {
+  min-height: 78px;
+  margin-bottom: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.history-header h1 {
+  margin: 3px 0 4px;
+  font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+  font-size: 23px;
+  letter-spacing: -0.035em;
+}
+
+.history-header p,
+.history-disclaimer {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.diagnostic-grid {
+  margin-bottom: 14px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.diagnostic-grid article {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.diagnostic-grid span,
+.diagnostic-grid strong {
+  display: block;
+}
+
+.diagnostic-grid span {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.diagnostic-grid strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-filters {
+  margin-bottom: 14px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  background: var(--paper);
+}
+
+.history-filters select {
+  width: 100%;
+  height: 40px;
+  margin-top: 6px;
+  padding: 0 10px;
+  border: 1px solid #d9d7cf;
+  border-radius: 9px;
+  color: var(--ink);
+  background: white;
+}
+
+.history-filter-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.history-results {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--paper);
+  box-shadow: 0 12px 36px rgba(43, 42, 38, 0.05);
+}
+
+.history-result-heading {
+  min-height: 48px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.history-result-heading strong {
+  font-size: 12px;
+}
+
+.history-result-heading span {
+  color: var(--muted);
+  font-size: 9px;
+  text-align: right;
+}
+
+.history-row {
+  padding: 15px 16px;
+  border-bottom: 1px solid #e9e7e0;
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) minmax(220px, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+}
+
+.history-row:last-child {
+  border-bottom: 0;
+}
+
+.history-row > div:first-child strong,
+.history-row > div:first-child small,
+.history-row-evidence span {
+  display: block;
+}
+
+.history-row > div:first-child strong {
+  margin: 4px 0;
+  font-size: 13px;
+}
+
+.history-row > div:first-child small,
+.history-row-evidence span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.history-row-evidence {
+  display: grid;
+  gap: 4px;
+}
+
+.history-row-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.history-row-actions .button {
+  min-height: 34px;
+  padding: 0 11px;
+}
+
+.history-disclaimer {
+  padding: 12px 4px 0;
 }
 
 .config-banner,
@@ -1534,7 +1735,8 @@ textarea:focus {
   }
 
   .brand > div:last-child,
-  .create-button:not(:focus) {
+  .create-button:not(:focus),
+  .sidebar-history strong {
     font-size: 0;
   }
 
@@ -1545,6 +1747,11 @@ textarea:focus {
 
   .create-button span {
     font-size: 22px;
+  }
+
+  .sidebar-history {
+    justify-content: center;
+    padding: 0;
   }
 
   .sidebar-label,
@@ -1568,6 +1775,20 @@ textarea:focus {
 
   .prompt-grid {
     grid-template-columns: 1fr;
+  }
+
+  .diagnostic-grid,
+  .history-filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .history-row {
+    grid-template-columns: 1fr auto;
+  }
+
+  .history-row-evidence {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 }
 
@@ -1598,6 +1819,12 @@ textarea:focus {
     width: 38px;
     min-height: 38px;
     margin-left: auto;
+  }
+
+  .sidebar-history {
+    width: 38px;
+    min-height: 38px;
+    margin: 0;
   }
 
   .agent-list {
@@ -1681,5 +1908,27 @@ textarea:focus {
 
   .form-grid {
     grid-template-columns: 1fr;
+  }
+
+  .history-header {
+    align-items: flex-start;
+  }
+
+  .diagnostic-grid,
+  .history-filters {
+    grid-template-columns: 1fr;
+  }
+
+  .history-row {
+    grid-template-columns: 1fr;
+  }
+
+  .history-row-evidence {
+    grid-column: auto;
+    grid-row: auto;
+  }
+
+  .history-row-actions .button {
+    flex: 1;
   }
 }

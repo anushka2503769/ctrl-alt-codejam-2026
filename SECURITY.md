@@ -12,6 +12,13 @@ credentials, personal data, or exploit details in an issue.
 ## Known limitations
 
 - Shared demo token; no user identity, authorization, RBAC, or tenant isolation
+- Run history, lifecycle events, metrics, exports, and diagnostics are stored in
+  the same single-process JSON database. They are not append-only, signed,
+  externally witnessed, tamper-proof, or attributable to individual users.
+- Evidence export omits prompts, Agent output, Run errors, verification output,
+  and absolute workspace paths. It intentionally retains policy metadata and
+  relative changed paths, which may still reveal project structure; review an
+  export before sharing it.
 - No CSRF protection
 - No per-Agent container boundary in ECS mode
 - Ordinary local containers, not hardened multi-tenant sandboxes

@@ -129,6 +129,24 @@ export function buildVerificationContainerArgs(
 export class ContainerVerificationRunner implements RunVaultVerificationRunner {
   constructor(private readonly config: AppConfig) {}
 
+  async isAvailable(): Promise<boolean> {
+    try {
+      const environment = this.engineEnvironment();
+      await execFileAsync(this.config.containerEngine, ["version"], {
+        timeout: 5_000,
+        env: environment,
+      });
+      await execFileAsync(
+        this.config.containerEngine,
+        ["image", "inspect", this.config.containerRuntimeImage],
+        { timeout: 5_000, env: environment },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async run(
     workspacePath: string,
     options: RunVaultVerificationRunnerOptions,

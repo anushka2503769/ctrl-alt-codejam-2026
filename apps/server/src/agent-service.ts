@@ -19,6 +19,15 @@ import {
   type RunVaultExecutionStatus,
 } from "./runvault-policy.js";
 import {
+  filterRunVaultHistory,
+  type RunVaultHistoryFilters,
+} from "./runvault-history.js";
+import {
+  appendRunVaultEvent,
+  emitRunVaultMetric,
+  emptyRunVaultMetrics,
+} from "./runvault-observability.js";
+import {
   buildBoundedTextDiff,
   validateReviewPath,
 } from "./runvault-review.js";
@@ -43,6 +52,12 @@ import type {
   RunVaultDecision,
   RunVaultFileChange,
   RunVaultReview,
+  RunVaultDiagnostics,
+  RunVaultEvidenceExport,
+  RunVaultHistoryEntry,
+  RunVaultLifecycleEvent,
+  RunVaultLifecycleEventType,
+  RunVaultRunMetrics,
   RunVaultTextDiff,
   RunVaultVerification,
   RunVaultPolicySnapshot,
@@ -53,6 +68,8 @@ import type {
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
+const elapsedMs = (startedAt: number) =>
+  Math.max(0, Math.round((performance.now() - startedAt) * 1_000) / 1_000);
 
 interface RevisionExecutionContext {
   parentRunId: string;
@@ -178,6 +195,20 @@ export class AgentService {
             decidedAt: completedAt,
           };
           run.completedAt = completedAt;
+          run.runVaultMetrics.outcome = "discarded";
+          run.runVaultMetrics.verificationStatus = "skipped";
+          run.runVaultMetrics.cleanupStatus = "completed";
+          appendRunVaultEvent(run, "decided", completedAt, {
+            outcome: "discarded",
+            resolution: "policy",
+          });
+          appendRunVaultEvent(run, "discarded", completedAt, {
+            outcome: "discarded",
+            resolution: "policy",
+          });
+          appendRunVaultEvent(run, "reconciled", completedAt, {
+            reconciliationAction: "interrupted_run",
+          });
         }
       }
       for (const agent of database.agents) {
@@ -193,7 +224,9 @@ export class AgentService {
         }
       }
     });
-    await this.runVaultWorkspaces.reconcileTransactions(this.store.snapshot());
+    const reconciliation = await this.runVaultWorkspaces.reconcileTransactions(
+      this.store.snapshot(),
+    );
     await this.store.mutate((database) => {
       const recoveredAt = now();
       for (const run of database.runs) {
@@ -215,6 +248,14 @@ export class AgentService {
         if (agent.status === "busy" && !hasActiveRun) {
           agent.status = "ready";
           agent.updatedAt = recoveredAt;
+        }
+      }
+      for (const record of reconciliation.records) {
+        const run = database.runs.find((item) => item.id === record.runId);
+        if (run) {
+          appendRunVaultEvent(run, "reconciled", reconciliation.at, {
+            reconciliationAction: record.action,
+          });
         }
       }
     });
@@ -389,6 +430,119 @@ export class AgentService {
       .snapshot()
       .runs.filter((run) => run.agentId === agentId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  getRunVaultHistory(filters: RunVaultHistoryFilters): RunVaultHistoryEntry[] {
+    return filterRunVaultHistory(this.store.snapshot(), filters);
+  }
+
+  getRunVaultEvidence(runId: string): RunVaultEvidenceExport {
+    const run = this.getRun(runId);
+    if (!run.runVault) {
+      throw new HttpError(409, "RunVault evidence is not available for this Run");
+    }
+    const decision = structuredClone(run.runVault);
+    const { verification, ...decisionWithoutVerification } = decision;
+    return {
+      version: 1,
+      exportedAt: now(),
+      run: {
+        id: run.id,
+        agentId: run.agentId,
+        parentRunId: run.parentRunId,
+        supersededByRunId: run.supersededByRunId,
+        revisionNumber: run.revisionNumber,
+        status: run.status,
+        startedAt: run.startedAt,
+        completedAt: run.completedAt,
+        createdAt: run.createdAt,
+      },
+      decision: {
+        ...decisionWithoutVerification,
+        verification: {
+          status: verification.status,
+          command: verification.command,
+        },
+      },
+      lifecycleEvents: structuredClone(run.runVaultEvents),
+      metrics: structuredClone(run.runVaultMetrics),
+    };
+  }
+
+  async runVaultDiagnostics(): Promise<RunVaultDiagnostics> {
+    await this.sweepExpiredQuarantines();
+    const database = this.store.snapshot();
+    const [staging, dependencies, verifierAvailable] = await Promise.all([
+      this.runVaultWorkspaces.diagnostics(database),
+      this.dependencies.diagnostics(),
+      this.verifier.isAvailable(),
+    ]);
+    const decided = database.runs.filter((run) => run.runVault !== null);
+    const stagingDurations = database.runs.flatMap((run) =>
+      run.runVaultMetrics.stagingDurationMs === null
+        ? []
+        : [run.runVaultMetrics.stagingDurationMs],
+    );
+    const verificationDurations = database.runs.flatMap((run) =>
+      run.runVaultMetrics.verificationDurationMs === null
+        ? []
+        : [run.runVaultMetrics.verificationDurationMs],
+    );
+    const average = (values: number[]) =>
+      values.length === 0
+        ? null
+        : Math.round(
+            (values.reduce((total, value) => total + value, 0) / values.length) *
+              1_000,
+          ) / 1_000;
+    return {
+      generatedAt: now(),
+      verifierAvailable,
+      staging,
+      dependencies,
+      metrics: {
+        totalRuns: database.runs.length,
+        decidedRuns: decided.length,
+        outcomes: {
+          promoted: decided.filter((run) => run.runVault?.outcome === "promoted")
+            .length,
+          quarantined: decided.filter(
+            (run) => run.runVault?.outcome === "quarantined",
+          ).length,
+          discarded: decided.filter((run) => run.runVault?.outcome === "discarded")
+            .length,
+        },
+        verification: {
+          passed: decided.filter(
+            (run) => run.runVault?.verification.status === "passed",
+          ).length,
+          failed: decided.filter(
+            (run) => run.runVault?.verification.status === "failed",
+          ).length,
+          skipped: decided.filter(
+            (run) => run.runVault?.verification.status === "skipped",
+          ).length,
+          unavailable: decided.filter(
+            (run) => run.runVault?.verification.status === "unavailable",
+          ).length,
+        },
+        cleanupFailures: database.runs.filter(
+          (run) => run.runVaultMetrics.cleanupStatus === "failed",
+        ).length,
+        averageStagingDurationMs: average(stagingDurations),
+        averageVerificationDurationMs: average(verificationDurations),
+        totalStagedBytes: database.runs.reduce(
+          (total, run) => total + (run.runVaultMetrics.stagingCopiedBytes ?? 0),
+          0,
+        ),
+        totalChangedBytes: database.runs.reduce(
+          (total, run) => total + run.runVaultMetrics.changedBytes,
+          0,
+        ),
+      },
+      storageModel: "single-process-json",
+      tamperProof: false,
+    };
   }
 
   async getRunVaultReview(runId: string): Promise<RunVaultReview> {
@@ -602,14 +756,14 @@ export class AgentService {
 
   async discardRun(runId: string): Promise<AgentRun> {
     await this.sweepExpiredQuarantines();
-    const updated = await this.store.mutate((database) => {
+    const result = await this.store.mutate((database) => {
       const run = database.runs.find((item) => item.id === runId);
       if (!run) throw new HttpError(404, "Run not found");
       if (
         run.runVault?.outcome === "discarded" &&
         run.runVault.resolution === "human_discarded"
       ) {
-        return structuredClone(run);
+        return { run: structuredClone(run), changed: false };
       }
       if (
         run.runVault?.outcome === "promoted" &&
@@ -625,19 +779,29 @@ export class AgentService {
       if (agent.status === "busy") {
         throw new HttpError(409, "Wait for the active Agent operation to finish");
       }
+      const discardedAt = now();
       run.runVault.outcome = "discarded";
       run.runVault.resolution = "human_discarded";
-      run.runVault.decidedAt = now();
-      return structuredClone(run);
+      run.runVault.decidedAt = discardedAt;
+      run.runVaultMetrics.outcome = "discarded";
+      appendRunVaultEvent(run, "discarded", discardedAt, {
+        outcome: "discarded",
+        resolution: "human_discarded",
+      });
+      return { run: structuredClone(run), changed: true };
     });
-    const stagingId = updated.runVault?.stagingWorkspaceId;
-    if (stagingId) {
-      await this.runVaultWorkspaces
-        .discardStagingWorkspace(stagingId)
-        .catch(() => undefined);
+    const stagingId = result.run.runVault?.stagingWorkspaceId;
+    if (result.changed && stagingId) {
+      const metrics = structuredClone(result.run.runVaultMetrics);
+      await this.cleanupStaging(stagingId, metrics);
+      await this.store.mutate((database) => {
+        const run = database.runs.find((item) => item.id === runId);
+        if (run) run.runVaultMetrics = metrics;
+      });
+      this.emitPersistedMetric(runId, "staging_cleanup");
     }
     this.scheduleRetentionSweep();
-    return updated;
+    return this.getRun(runId);
   }
 
   async sendMessage(
@@ -665,6 +829,8 @@ export class AgentService {
       error: null,
       usage: null,
       runVault: null,
+      runVaultEvents: [],
+      runVaultMetrics: emptyRunVaultMetrics(),
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
@@ -761,6 +927,8 @@ export class AgentService {
         error: null,
         usage: null,
         runVault: null,
+        runVaultEvents: [],
+        runVaultMetrics: emptyRunVaultMetrics(),
         startedAt: null,
         completedAt: null,
         createdAt: timestamp,
@@ -780,6 +948,12 @@ export class AgentService {
           throw new HttpError(409, "Parent Run changed during revision creation");
         }
         parent.supersededByRunId = runId;
+        appendRunVaultEvent(parent, "revision_requested", timestamp, {
+          relatedRunId: runId,
+        });
+        appendRunVaultEvent(run, "revision_requested", timestamp, {
+          relatedRunId: parentRunId,
+        });
         database.runs.push(run);
         database.messages.push(message);
       });
@@ -834,6 +1008,7 @@ export class AgentService {
     revision?: RevisionExecutionContext,
   ): Promise<void> {
     const policySnapshot = this.policySnapshot(run.createdAt);
+    const metrics = emptyRunVaultMetrics();
     const stagingQuota = {
       perRunBytes: policySnapshot.stagingPerRunBytes,
       totalBytes: policySnapshot.stagingTotalBytes,
@@ -855,6 +1030,7 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+      const stagingStartedAt = performance.now();
       staging = revision
         ? await this.runVaultWorkspaces.createRevisionStagingWorkspace(
             run.id,
@@ -869,18 +1045,37 @@ export class AgentService {
             agentAtStart.workspacePath,
             stagingQuota,
           );
+      metrics.stagingDurationMs = elapsedMs(stagingStartedAt);
+      metrics.stagingCopiedEntries = staging.metrics.copiedEntryCount;
+      metrics.stagingCopiedBytes = staging.metrics.estimatedCopiedBytes;
+      await this.recordRunProgress(
+        run.id,
+        "staged",
+        now(),
+        {},
+        {
+          stagingDurationMs: metrics.stagingDurationMs,
+          stagingCopiedEntries: metrics.stagingCopiedEntries,
+          stagingCopiedBytes: metrics.stagingCopiedBytes,
+        },
+      );
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
       const initialDependencies = await this.dependencies.resolve(staging.path);
       const initialDependencyMount = dependencyMountForRun(initialDependencies);
-      runnerResult = await this.runWithStagingQuota({
-        agentId: agentAtStart.id,
-        workspacePath: staging.path,
-        prompt: run.prompt,
-        threadId: revision?.baseThreadId ?? agentAtStart.codexThreadId,
-        dependencyCachePath: initialDependencyMount,
-      }, staging.path, stagingQuota);
+      const agentStartedAt = performance.now();
+      try {
+        runnerResult = await this.runWithStagingQuota({
+          agentId: agentAtStart.id,
+          workspacePath: staging.path,
+          prompt: run.prompt,
+          threadId: revision?.baseThreadId ?? agentAtStart.codexThreadId,
+          dependencyCachePath: initialDependencyMount,
+        }, staging.path, stagingQuota);
+      } finally {
+        metrics.agentDurationMs = elapsedMs(agentStartedAt);
+      }
       if (runnerResult.threadId === (revision?.baseThreadId ?? agentAtStart.codexThreadId)) {
         throw new Error("Codex did not create a distinct provisional thread");
       }
@@ -888,14 +1083,24 @@ export class AgentService {
         throw new RunCancelledError();
       }
 
+      const firstInspectionStartedAt = performance.now();
       const beforeVerification = await this.runVaultWorkspaces.inspectChanges(
         staging.trustedSnapshot,
         staging.path,
         policySnapshot.protectedPatterns,
       );
+      metrics.inspectionDurationMs = elapsedMs(firstInspectionStartedAt);
+      await this.recordRunProgress(
+        run.id,
+        "inspected",
+        now(),
+        {},
+        { inspectionDurationMs: metrics.inspectionDurationMs },
+      );
       const dependencyFilesChanged = beforeVerification.changes.some(
         (change) => change.dependencyFile,
       );
+      const verificationStartedAt = performance.now();
       let verificationDependencyMount: string | null = null;
       let dependencyVerificationBlocked = false;
       let verificationDependencies: DependencyResolution | null = null;
@@ -954,12 +1159,28 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+      metrics.verificationDurationMs = elapsedMs(verificationStartedAt);
+      metrics.verificationStatus = verification.status;
+      await this.recordRunProgress(
+        run.id,
+        "verified",
+        now(),
+        { verificationStatus: verification.status },
+        {
+          verificationDurationMs: metrics.verificationDurationMs,
+          verificationStatus: metrics.verificationStatus,
+        },
+      );
 
+      const finalInspectionStartedAt = performance.now();
       const inspection = await this.runVaultWorkspaces.inspectChanges(
         staging.trustedSnapshot,
         staging.path,
         policySnapshot.protectedPatterns,
       );
+      metrics.inspectionDurationMs =
+        (metrics.inspectionDurationMs ?? 0) +
+        elapsedMs(finalInspectionStartedAt);
       await this.runVaultWorkspaces.assertStagingWithinQuota(
         staging.path,
         stagingQuota,
@@ -967,6 +1188,7 @@ export class AgentService {
       const currentTrusted = await this.runVaultWorkspaces.snapshotWorkspace(
         agentAtStart.workspacePath,
       );
+      const decisionStartedAt = performance.now();
       let policy = evaluateRunVaultPolicy({
         executionStatus: "succeeded",
         verificationStatus: verification.status,
@@ -976,6 +1198,11 @@ export class AgentService {
         trustedWorkspaceChanged:
           currentTrusted.fingerprint !== staging.trustedSnapshot.fingerprint,
       });
+      metrics.decisionDurationMs = elapsedMs(decisionStartedAt);
+      metrics.changedFileCount = inspection.changes.length;
+      metrics.changedBytes = inspection.changedBytes;
+      metrics.outcome = policy.outcome;
+      metrics.verificationStatus = verification.status;
       const initialDecidedAt = now();
       let decision: RunVaultDecision = {
         outcome: policy.outcome,
@@ -1027,6 +1254,7 @@ export class AgentService {
             ...retentionForOutcome(policy.outcome, changedAt, policySnapshot),
             decidedAt: changedAt,
           };
+          metrics.outcome = policy.outcome;
         }
 
         if (promotion) {
@@ -1039,40 +1267,46 @@ export class AgentService {
               run,
               runnerResult,
               decision,
+              metrics,
             );
             promotionCommitted = true;
           } catch (error) {
             await this.runVaultWorkspaces.rollbackPromotion(promotion);
             throw error;
           }
-          await this.runVaultWorkspaces.finalizePromotion(promotion).catch(
-            () => undefined,
-          );
-          await this.publishCommittedPromotion(agentAtStart.id, run.id);
-          if (revision) {
-            await this.runVaultWorkspaces
-              .discardStagingWorkspace(revision.sourceStagingId)
-              .catch(() => undefined);
+          const cleanupStartedAt = performance.now();
+          try {
+            await this.runVaultWorkspaces.finalizePromotion(promotion);
+            metrics.cleanupStatus = "completed";
+          } catch {
+            metrics.cleanupStatus = "failed";
           }
+          metrics.cleanupDurationMs = elapsedMs(cleanupStartedAt);
+          if (revision) {
+            await this.cleanupStaging(revision.sourceStagingId, metrics);
+          }
+          await this.publishCommittedPromotion(agentAtStart.id, run.id, metrics);
+          this.emitPersistedMetric(run.id, "run_decision");
           return;
         }
       }
 
       if (decision.outcome === "discarded") {
-        await this.runVaultWorkspaces
-          .discardStagingWorkspace(staging.id)
-          .catch(() => undefined);
+        await this.cleanupStaging(staging.id, metrics);
       } else if (revision && decision.outcome === "quarantined") {
-        await this.runVaultWorkspaces
-          .discardStagingWorkspace(revision.sourceStagingId)
-          .catch(() => undefined);
+        await this.cleanupStaging(revision.sourceStagingId, metrics);
+        metrics.cleanupStatus = "retained";
+      } else if (decision.outcome === "quarantined") {
+        metrics.cleanupStatus = "retained";
       }
       await this.persistCompletedRun(
         agentAtStart,
         run,
         runnerResult,
         decision,
+        metrics,
       );
+      this.emitPersistedMetric(run.id, "run_decision");
       this.scheduleRetentionSweep();
     } catch (error) {
       if (promotionCommitted) {
@@ -1123,6 +1357,7 @@ export class AgentService {
           : quotaExceeded
             ? "quota_exceeded"
             : "failed";
+      const failedDecisionStartedAt = performance.now();
       const policy = evaluateRunVaultPolicy({
         executionStatus,
         verificationStatus: verification.status,
@@ -1131,6 +1366,7 @@ export class AgentService {
         policy: policySnapshot,
         trustedWorkspaceChanged,
       });
+      metrics.decisionDurationMs = elapsedMs(failedDecisionStartedAt);
       const retention = retentionForOutcome(
         policy.outcome,
         completedAt,
@@ -1153,10 +1389,12 @@ export class AgentService {
         ...retention,
         decidedAt: completedAt,
       };
+      metrics.changedFileCount = changes.length;
+      metrics.changedBytes = changedBytes;
+      metrics.outcome = policy.outcome;
+      metrics.verificationStatus = verification.status;
       if (staging) {
-        await this.runVaultWorkspaces
-          .discardStagingWorkspace(staging.id)
-          .catch(() => undefined);
+        await this.cleanupStaging(staging.id, metrics);
       }
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
@@ -1167,6 +1405,15 @@ export class AgentService {
           storedRun.usage = runnerResult?.usage ?? null;
           storedRun.error = message;
           storedRun.runVault = decision;
+          storedRun.runVaultMetrics = structuredClone(metrics);
+          appendRunVaultEvent(storedRun, "decided", completedAt, {
+            outcome: decision.outcome,
+            resolution: decision.resolution,
+          });
+          appendRunVaultEvent(storedRun, "discarded", completedAt, {
+            outcome: decision.outcome,
+            resolution: decision.resolution,
+          });
           storedRun.completedAt = completedAt;
         }
         if (agent) {
@@ -1177,6 +1424,7 @@ export class AgentService {
           agent.updatedAt = completedAt;
         }
       });
+      this.emitPersistedMetric(run.id, "run_decision");
     }
   }
 
@@ -1185,6 +1433,7 @@ export class AgentService {
     run: AgentRun,
     result: RunnerResult,
     decision: RunVaultDecision,
+    metrics: RunVaultRunMetrics,
   ): Promise<void> {
     const completedAt = now();
     await this.store.mutate((database) => {
@@ -1195,6 +1444,17 @@ export class AgentService {
       storedRun.output = result.output;
       storedRun.usage = result.usage;
       storedRun.runVault = decision;
+      storedRun.runVaultMetrics = structuredClone(metrics);
+      appendRunVaultEvent(storedRun, "decided", decision.decidedAt, {
+        outcome: decision.outcome,
+        resolution: decision.resolution,
+      });
+      if (decision.outcome === "discarded") {
+        appendRunVaultEvent(storedRun, "discarded", decision.decidedAt, {
+          outcome: decision.outcome,
+          resolution: decision.resolution,
+        });
+      }
       storedRun.completedAt = completedAt;
       agent.status = "ready";
       agent.lastError = null;
@@ -1207,6 +1467,7 @@ export class AgentService {
     run: AgentRun,
     result: RunnerResult,
     decision: RunVaultDecision,
+    metrics: RunVaultRunMetrics,
   ): Promise<void> {
     const committedAt = now();
     await this.store.mutate((database) => {
@@ -1218,6 +1479,11 @@ export class AgentService {
       storedRun.output = result.output;
       storedRun.usage = result.usage;
       storedRun.runVault = decision;
+      storedRun.runVaultMetrics = structuredClone(metrics);
+      appendRunVaultEvent(storedRun, "decided", decision.decidedAt, {
+        outcome: decision.outcome,
+        resolution: decision.resolution,
+      });
       if (
         !database.messages.some(
           (message) => message.runId === run.id && message.role === "assistant",
@@ -1241,6 +1507,7 @@ export class AgentService {
   private async publishCommittedPromotion(
     agentId: string,
     runId: string,
+    metrics?: RunVaultRunMetrics,
   ): Promise<void> {
     const completedAt = now();
     await this.store.mutate((database) => {
@@ -1255,6 +1522,11 @@ export class AgentService {
       storedRun.status = "completed";
       storedRun.error = null;
       storedRun.completedAt = completedAt;
+      if (metrics) storedRun.runVaultMetrics = structuredClone(metrics);
+      appendRunVaultEvent(storedRun, "promoted", completedAt, {
+        outcome: "promoted",
+        resolution: storedRun.runVault.resolution,
+      });
       if (agent.status !== "stopped") {
         agent.status = "ready";
       }
@@ -1313,7 +1585,7 @@ export class AgentService {
       }
 
       const completedAt = now();
-      const updated = await this.store.mutate((database) => {
+      await this.store.mutate((database) => {
         const run = database.runs.find((item) => item.id === runAtStart.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
         if (!run || !agent) throw new HttpError(404, "Run or Agent not found");
@@ -1323,6 +1595,11 @@ export class AgentService {
         run.runVault.outcome = "promoted";
         run.runVault.resolution = "human_approved";
         run.runVault.decidedAt = completedAt;
+        run.runVaultMetrics.outcome = "promoted";
+        appendRunVaultEvent(run, "approved", completedAt, {
+          outcome: "promoted",
+          resolution: "human_approved",
+        });
         agent.codexThreadId = decision.provisionalThreadId;
         agent.status = previousStatus === "stopped" ? "stopped" : "ready";
         agent.lastError = null;
@@ -1341,12 +1618,28 @@ export class AgentService {
             createdAt: completedAt,
           });
         }
-        return structuredClone(run);
       });
-      await this.runVaultWorkspaces.finalizePromotion(promotion).catch(
-        () => undefined,
-      );
-      return updated;
+      const metrics = structuredClone(runAtStart.runVaultMetrics);
+      metrics.outcome = "promoted";
+      const cleanupStartedAt = performance.now();
+      try {
+        await this.runVaultWorkspaces.finalizePromotion(promotion);
+        metrics.cleanupStatus = "completed";
+      } catch {
+        metrics.cleanupStatus = "failed";
+      }
+      metrics.cleanupDurationMs = elapsedMs(cleanupStartedAt);
+      await this.store.mutate((database) => {
+        const run = database.runs.find((item) => item.id === runAtStart.id);
+        if (!run || run.runVault?.outcome !== "promoted") return;
+        run.runVaultMetrics = metrics;
+        appendRunVaultEvent(run, "promoted", now(), {
+          outcome: "promoted",
+          resolution: "human_approved",
+        });
+      });
+      this.emitPersistedMetric(runAtStart.id, "staging_cleanup");
+      return this.getRun(runAtStart.id);
     } catch (error) {
       if (promotion) {
         try {
@@ -1421,7 +1714,8 @@ export class AgentService {
   private async performRetentionSweep(referenceTime: number): Promise<number> {
     const expired = await this.store.mutate((database) => {
       const expiredAt = new Date(referenceTime).toISOString();
-      const stagingIds = new Set<string>();
+      const cleanups = new Map<string, string>();
+      const newlyExpiredRunIds: string[] = [];
       let newlyExpired = 0;
       for (const run of database.runs) {
         const decision = run.runVault;
@@ -1430,7 +1724,7 @@ export class AgentService {
           decision.resolution === "expired" &&
           decision.stagingWorkspaceId
         ) {
-          stagingIds.add(decision.stagingWorkspaceId);
+          cleanups.set(run.id, decision.stagingWorkspaceId);
           continue;
         }
         if (
@@ -1443,13 +1737,23 @@ export class AgentService {
         const agent = database.agents.find((item) => item.id === run.agentId);
         if (agent?.status === "busy") continue;
         if (decision.stagingWorkspaceId) {
-          stagingIds.add(decision.stagingWorkspaceId);
+          cleanups.set(run.id, decision.stagingWorkspaceId);
         }
         newlyExpired += 1;
+        newlyExpiredRunIds.push(run.id);
         decision.outcome = "discarded";
         decision.reason = "retention_expired";
         decision.resolution = "expired";
         decision.decidedAt = expiredAt;
+        run.runVaultMetrics.outcome = "discarded";
+        appendRunVaultEvent(run, "expired", expiredAt, {
+          outcome: "discarded",
+          resolution: "expired",
+        });
+        appendRunVaultEvent(run, "discarded", expiredAt, {
+          outcome: "discarded",
+          resolution: "expired",
+        });
         if (
           !decision.findings.some(
             (finding) => finding.code === "retention_expired",
@@ -1467,15 +1771,32 @@ export class AgentService {
           });
         }
       }
-      return { newlyExpired, stagingIds: [...stagingIds] };
+      return {
+        newlyExpired,
+        newlyExpiredRunIds,
+        cleanups: [...cleanups].map(([runId, stagingId]) => ({ runId, stagingId })),
+      };
     });
-    await Promise.all(
-      expired.stagingIds.map((stagingId) =>
-        this.runVaultWorkspaces
-          .discardStagingWorkspace(stagingId)
-          .catch(() => undefined),
-      ),
+    const cleanupResults = await Promise.all(
+      expired.cleanups.map(async ({ runId, stagingId }) => {
+        const metrics = structuredClone(this.getRun(runId).runVaultMetrics);
+        await this.cleanupStaging(stagingId, metrics);
+        return { runId, metrics };
+      }),
     );
+    if (cleanupResults.length > 0) {
+      await this.store.mutate((database) => {
+        for (const result of cleanupResults) {
+          const run = database.runs.find((item) => item.id === result.runId);
+          if (run?.runVault?.resolution === "expired") {
+            run.runVaultMetrics = result.metrics;
+          }
+        }
+      });
+    }
+    for (const runId of expired.newlyExpiredRunIds) {
+      this.emitPersistedMetric(runId, "staging_cleanup");
+    }
     return expired.newlyExpired;
   }
 
@@ -1506,6 +1827,45 @@ export class AgentService {
       ...structuredClone(this.config.runVaultPolicy),
       capturedAt,
     };
+  }
+
+  private async recordRunProgress(
+    runId: string,
+    type: RunVaultLifecycleEventType,
+    at: string,
+    details: Omit<RunVaultLifecycleEvent, "type" | "at"> = {},
+    metrics: Partial<RunVaultRunMetrics> = {},
+  ): Promise<void> {
+    await this.store.mutate((database) => {
+      const run = database.runs.find((item) => item.id === runId);
+      if (!run) return;
+      appendRunVaultEvent(run, type, at, details);
+      Object.assign(run.runVaultMetrics, metrics);
+    });
+  }
+
+  private async cleanupStaging(
+    stagingId: string,
+    metrics: RunVaultRunMetrics,
+  ): Promise<void> {
+    const startedAt = performance.now();
+    try {
+      await this.runVaultWorkspaces.discardStagingWorkspace(stagingId);
+      metrics.cleanupStatus = "completed";
+    } catch {
+      metrics.cleanupStatus = "failed";
+    } finally {
+      metrics.cleanupDurationMs =
+        (metrics.cleanupDurationMs ?? 0) + elapsedMs(startedAt);
+    }
+  }
+
+  private emitPersistedMetric(
+    runId: string,
+    name: "run_decision" | "staging_cleanup",
+  ): void {
+    const run = this.getRun(runId);
+    emitRunVaultMetric(name, run, now());
   }
 
   private async runWithStagingQuota(

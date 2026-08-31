@@ -118,6 +118,58 @@ describe("HTTP boundary", () => {
     await app.close();
   });
 
+  it("exposes validated history, evidence downloads, and diagnostics", async () => {
+    const runId = "123e4567-e89b-42d3-a456-426614174000";
+    const getRunVaultHistory = vi.fn(() => [{ id: runId }]);
+    const getRunVaultEvidence = vi.fn(() => ({ version: 1, run: { id: runId } }));
+    const runVaultDiagnostics = vi.fn(async () => ({
+      storageModel: "single-process-json",
+      tamperProof: false,
+    }));
+    const historyService = {
+      getRunVaultHistory,
+      getRunVaultEvidence,
+      runVaultDiagnostics,
+    } as unknown as AgentService;
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), historyService);
+
+    const history = await app.inject({
+      method: "GET",
+      url: `/api/runs?outcome=quarantined&lineage=revision&lineageRunId=${runId}&limit=20`,
+    });
+    const evidence = await app.inject({
+      method: "GET",
+      url: `/api/runs/${runId}/runvault/evidence`,
+    });
+    const diagnostics = await app.inject({
+      method: "GET",
+      url: "/api/runvault/diagnostics",
+    });
+    const invalid = await app.inject({
+      method: "GET",
+      url: "/api/runs?limit=201",
+    });
+
+    expect(history.statusCode).toBe(200);
+    expect(getRunVaultHistory).toHaveBeenCalledWith({
+      outcome: "quarantined",
+      lineage: "revision",
+      lineageRunId: runId,
+      limit: 20,
+    });
+    expect(evidence.headers["content-disposition"]).toBe(
+      `attachment; filename="runvault-evidence-${runId}.json"`,
+    );
+    expect(evidence.json()).toEqual({
+      evidence: { version: 1, run: { id: runId } },
+    });
+    expect(diagnostics.json()).toEqual({
+      diagnostics: { storageModel: "single-process-json", tamperProof: false },
+    });
+    expect(invalid.statusCode).toBe(400);
+    await app.close();
+  });
+
   it("requires explicit network confirmation for dependency preparation", async () => {
     const agentId = "123e4567-e89b-42d3-a456-426614174000";
     const prepareDependencies = vi.fn(async () => ({

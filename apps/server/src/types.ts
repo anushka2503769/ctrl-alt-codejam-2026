@@ -121,6 +121,137 @@ export interface RunVaultDecision {
   decidedAt: string;
 }
 
+export type RunVaultLifecycleEventType =
+  | "staged"
+  | "inspected"
+  | "verified"
+  | "decided"
+  | "revision_requested"
+  | "approved"
+  | "promoted"
+  | "discarded"
+  | "expired"
+  | "reconciled";
+
+export interface RunVaultLifecycleEvent {
+  type: RunVaultLifecycleEventType;
+  at: string;
+  outcome?: RunVaultOutcome | undefined;
+  verificationStatus?: RunVaultVerificationStatus | undefined;
+  resolution?: RunVaultResolution | undefined;
+  relatedRunId?: string | undefined;
+  reconciliationAction?:
+    | "completed_promotion"
+    | "restored_quarantine"
+    | "discarded_staging"
+    | "interrupted_run"
+    | undefined;
+}
+
+export type RunVaultCleanupStatus =
+  | "not_required"
+  | "retained"
+  | "completed"
+  | "failed";
+
+export interface RunVaultRunMetrics {
+  stagingDurationMs: number | null;
+  stagingCopiedEntries: number | null;
+  stagingCopiedBytes: number | null;
+  agentDurationMs: number | null;
+  inspectionDurationMs: number | null;
+  verificationDurationMs: number | null;
+  decisionDurationMs: number | null;
+  cleanupDurationMs: number | null;
+  cleanupStatus: RunVaultCleanupStatus;
+  changedFileCount: number;
+  changedBytes: number;
+  outcome: RunVaultOutcome | null;
+  verificationStatus: RunVaultVerificationStatus | null;
+}
+
+export interface RunVaultHistoryEntry {
+  id: string;
+  agentId: string;
+  agentName: string | null;
+  parentRunId: string | null;
+  supersededByRunId: string | null;
+  revisionNumber: number;
+  status: RunStatus;
+  createdAt: string;
+  completedAt: string | null;
+  outcome: RunVaultOutcome | null;
+  reason: RunVaultReason | null;
+  resolution: RunVaultResolution | null;
+  verificationStatus: RunVaultVerificationStatus | null;
+  findingCodes: RunVaultFindingCode[];
+  changedFileCount: number;
+  changedBytes: number;
+  retainedAt: string | null;
+  expiresAt: string | null;
+}
+
+export interface RunVaultEvidenceExport {
+  version: 1;
+  exportedAt: string;
+  run: {
+    id: string;
+    agentId: string;
+    parentRunId: string | null;
+    supersededByRunId: string | null;
+    revisionNumber: number;
+    status: RunStatus;
+    startedAt: string | null;
+    completedAt: string | null;
+    createdAt: string;
+  };
+  decision: Omit<RunVaultDecision, "verification"> & {
+    verification: Pick<RunVaultVerification, "status" | "command">;
+  };
+  lifecycleEvents: RunVaultLifecycleEvent[];
+  metrics: RunVaultRunMetrics;
+}
+
+export interface RunVaultDiagnostics {
+  generatedAt: string;
+  verifierAvailable: boolean;
+  staging: {
+    retainedRunCount: number;
+    missingRetainedRunCount: number;
+    retainedBytes: number;
+    totalManagedBytes: number;
+    orphanCount: number;
+    orphanBytes: number;
+    promotionMarkerCount: number;
+    backupCount: number;
+    lastReconciliationAt: string | null;
+    lastReconciledTransactions: number;
+    lastRemovedOrphans: number;
+    lastRemovedOrphanBytes: number;
+  };
+  dependencies: {
+    mode: "disabled" | "existing-cache" | "isolated-ci";
+    validCacheCount: number;
+    invalidCacheCount: number;
+    partialCacheCount: number;
+    totalBytes: number;
+    activePreparations: number;
+  };
+  metrics: {
+    totalRuns: number;
+    decidedRuns: number;
+    outcomes: Record<RunVaultOutcome, number>;
+    verification: Record<RunVaultVerificationStatus, number>;
+    cleanupFailures: number;
+    averageStagingDurationMs: number | null;
+    averageVerificationDurationMs: number | null;
+    totalStagedBytes: number;
+    totalChangedBytes: number;
+  };
+  storageModel: "single-process-json";
+  tamperProof: false;
+}
+
 export type RunVaultReviewAvailability =
   | "available"
   | "not_retained"
@@ -191,6 +322,8 @@ export interface AgentRun {
   error: string | null;
   usage: RunUsage | null;
   runVault: RunVaultDecision | null;
+  runVaultEvents: RunVaultLifecycleEvent[];
+  runVaultMetrics: RunVaultRunMetrics;
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
