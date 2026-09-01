@@ -32,46 +32,12 @@ policy, review, recovery, and evidence layers around every Run.
 The workspace and its Codex thread advance together. A discarded or
 quarantined Run does not become the context for later trusted work.
 
-## Product tour
-
-### Agent Playground
+## Product preview
 
 ![RunVault Agent Playground with Agent controls, starter prompts, persistent workspaces, and the Codex Runtime](docs/assets/agent-playground.png)
 
 *The browser Playground provides a persistent workspace and resumable Codex
 session for each coding Agent.*
-
-### Create an Agent
-
-![Create Agent form for configuring the Agent name, description, and workspace instructions](docs/assets/create-agent.png)
-
-*Each Agent is configured with its own identity, purpose, and workspace
-instructions before it begins handling Runs.*
-
-### Run history and operational diagnostics
-
-![Initial RunVault history dashboard with verifier, staging, dependency-cache, cleanup, and filter controls](docs/assets/runvault-dashboard1.png)
-
-*The dashboard exposes Runtime readiness, retained staging, dependency-cache
-state, cleanup health, and decision filters even before Run evidence is
-recorded.*
-
-![Populated RunVault history dashboard with mixed outcomes, verification evidence, and JSON export controls](docs/assets/runvault-dashboard2.png)
-
-*After Agents complete work, operators can search decisions across Runs, reopen
-the exact review, and export bounded redacted JSON evidence.*
-
-### Review and resolve a quarantined Run
-
-![RunVault focused review showing a protected deployment change, policy snapshot, workspace outcome, and verification status](docs/assets/needs-review1.png)
-
-*A protected change is retained in staging while the trusted workspace remains
-unchanged. Workspace outcome and verification status are reported separately.*
-
-![RunVault quarantine controls for approving, discarding, or revising a protected change](docs/assets/needs-review2.png)
-
-*The operator can approve and promote the staged proposal, discard it, or
-request a child revision Run without trusting the parent proposal.*
 
 ## Installation
 
@@ -211,6 +177,34 @@ exposing the Ark API key:
 curl --fail http://localhost:3000/api/system
 ```
 
+## Product tour
+
+### Create an Agent
+
+![Create Agent form for configuring the Agent name, description, and workspace instructions](docs/assets/create-agent.png)
+
+*Each Agent is configured with its own name, purpose, and workspace instructions
+before it begins handling Runs.*
+
+### Run history and operational diagnostics
+
+![Populated RunVault history dashboard with mixed outcomes, verification evidence, and JSON export controls](docs/assets/runvault-dashboard2.png)
+
+*After Agents complete work, operators can search decisions across Runs, reopen
+the exact review, and export bounded redacted JSON evidence.*
+
+### Review and resolve a quarantined Run
+
+![RunVault focused review showing a protected deployment change, policy snapshot, workspace outcome, and verification status](docs/assets/needs-review1.png)
+
+*A protected change is retained in staging while the trusted workspace remains
+unchanged. Workspace outcome and verification status are reported separately.*
+
+![RunVault quarantine controls for approving, discarding, or revising a protected change](docs/assets/needs-review2.png)
+
+*The operator can approve and promote the staged proposal, discard it, or
+request a child revision Run without trusting the parent proposal.*
+
 ## How RunVault decides
 
 ```mermaid
@@ -332,6 +326,32 @@ verification to pass.
 
 See [Architecture](docs/ARCHITECTURE.md) for component boundaries, trust
 boundaries, promotion recovery, storage, and extension points.
+
+## Limitations and security scope
+
+RunVault deliberately provides a narrow transactional-workspace guarantee. It
+controls how Agent changes enter the trusted workspace, but it is not a complete
+production security platform.
+
+- RunVault is a single-operator proof of concept. Its shared token is not user
+  identity, authorization, RBAC, or tenant isolation, and the application does
+  not implement CSRF protection.
+- Agent and verification Runtimes use ordinary containers, not hardened
+  multi-tenant sandboxes. ECS mode does not provide a separate container
+  boundary for every Agent.
+- Docker Compose gives the control plane access to the host Docker socket.
+  Agent and verification containers do not receive that socket, but compromise
+  of the control plane could still affect the host.
+- The Ark API key is available to the server and active Agent Runtime. Use a
+  scoped, revocable demo key and never provide production data or credentials.
+- Run history, evidence, metrics, and diagnostics use single-process JSON
+  persistence. They are redacted operational evidence, not a signed,
+  append-only, or tamper-proof audit log.
+- Quarantined staging expires according to the configured retention period.
+  After expiry, the staged files cannot be approved or recovered.
+
+See [SECURITY.md](SECURITY.md) for the complete threat model, operational
+constraints, and safe-use guidance.
 
 ## Configuration
 
