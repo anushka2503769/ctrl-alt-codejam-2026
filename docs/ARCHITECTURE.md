@@ -3,23 +3,10 @@
 RunVault extends the Volc Agent Launchpad single-node control plane with a
 transactional workspace boundary for hackathon use.
 
-```mermaid
-flowchart LR
-    UI["React Web UI"] --> API["Fastify API"]
-    API --> Service["AgentService"]
-    Service --> Store["JSON store"]
-    Service --> Stage["RunVault staging workspace"]
-    Stage --> Runner{"AgentRunner"}
-    Runner -->|Local POC| Container["Disposable Runtime container"]
-    Runner -->|ECS| Process["Codex child process"]
-    Runner --> Inspect["Change inspection + verification"]
-    Inspect --> Decision{"Policy decision"}
-    Decision -->|Promote| Workspace["Trusted Agent workspace"]
-    Decision -->|Quarantine| Stage
-    Decision -->|Discard| Cleanup["Remove staged state"]
-    Container --> Ark["Volcengine Ark"]
-    Process --> Ark
-```
+![RunVault architecture showing the React UI, Fastify control plane, transactional staging boundary, Codex Runtime, verification, policy outcomes, instrumentation, and recovery](assets/runvault_architecture.png)
+
+*Every Agent Run operates in an untrusted staging workspace. Only RunVault's
+inspected policy and promotion path can update the trusted workspace.*
 
 ## Components
 
